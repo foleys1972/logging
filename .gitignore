@@ -13,6 +13,9 @@ build/
 .wba_key
 wba_config.json
 
+# Local reference copy — keep untracked (not part of this repo)
+etsv3.py
+
 # Logs & databases
 logs/
 *.log
