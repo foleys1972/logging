@@ -62,6 +62,9 @@ class LogRotator:
             fh.write(message + "\n")
 
     def cleanup(self) -> None:
+        """Delete *.log files older than retention_days (mtime, UTC). retention_days 0 = no-op."""
+        if self.retention_days <= 0:
+            return
         cutoff = datetime.now(timezone.utc).timestamp() - (self.retention_days * 86400)
         for path in self.site_dir.glob("*.log"):
             try:

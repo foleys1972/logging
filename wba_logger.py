@@ -16,7 +16,7 @@ Features:
 - Proper re-authentication cycle per API specification
 - Graceful shutdown with proper unsubscribe handling
 - Per-site custom log directory selection
-- Log rotation and retention
+- Log rotation and configurable retention (delete files older than N days; 0 = disabled)
 - SSL certificate verification bypass (for self-signed certs)
 - Auto-start sites on application launch
 - Auto-reconnect with 3 retry attempts on connection loss
@@ -50,7 +50,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 import threading
 import time
 
@@ -58,7 +58,8 @@ import time
 CONFIG_FILE = "wba_config.json"
 LOG_BASE_DIR = "logs"
 MAX_LOG_SIZE = 50 * 1024 * 1024  # 50MB
-LOG_RETENTION_DAYS = 365
+DEFAULT_LOG_RETENTION_DAYS = 365
+MAX_LOG_RETENTION_DAYS = 3650
 
 # Available WBA commands
 AVAILABLE_COMMANDS = {
@@ -96,12 +97,77 @@ TPO_COMPARE_FIELDS = (
 # Default commands for new sites
 DEFAULT_COMMANDS = ["get_zones", "get_tpos", "get_version", "get_health_api_report"]
 
+# Extended + historical commands may use "once daily at HH:MM" instead of every global interval
+SCHEDULABLE_COMMAND_KEYS = frozenset(
+    [c for c, _ in AVAILABLE_COMMANDS["extended"]]
+    + [c for c, _ in AVAILABLE_COMMANDS["historical"]]
+)
+
+
+def _parse_daily_time(value) -> str:
+    """Normalize time to HH:MM (24h local)."""
+    if value is None:
+        return "02:00"
+    s = str(value).strip()
+    parts = s.replace(".", ":").split(":")
+    if len(parts) >= 2:
+        try:
+            h = max(0, min(23, int(parts[0])))
+            m = max(0, min(59, int(parts[1])))
+            return f"{h:02d}:{m:02d}"
+        except ValueError:
+            pass
+    return "02:00"
+
+
+def migrate_site_command_settings(site: Dict) -> None:
+    """Ensure command_settings exists and is valid for each enabled command."""
+    cmds = site.get("commands") or []
+    raw = site.get("command_settings")
+    settings: Dict = {k: v for k, v in (raw or {}).items() if k in cmds} if isinstance(raw, dict) else {}
+    for c in cmds:
+        if c not in settings or not isinstance(settings[c], dict):
+            settings[c] = {"schedule": "interval"}
+            continue
+        entry = settings[c]
+        sched = entry.get("schedule", "interval")
+        if sched not in ("interval", "daily"):
+            sched = "interval"
+        if sched == "daily" and c not in SCHEDULABLE_COMMAND_KEYS:
+            sched = "interval"
+        entry["schedule"] = sched
+        entry["daily_time"] = _parse_daily_time(entry.get("daily_time"))
+        settings[c] = entry
+    site["command_settings"] = settings
+
+
+def split_commands_by_schedule(site_config: Dict) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Returns (interval_command_list, daily_list of (cmd, HH:MM))."""
+    migrate_site_command_settings(site_config)
+    cmds = site_config.get("commands") or []
+    settings = site_config.get("command_settings") or {}
+    interval_cmds = []
+    daily = []
+    for c in cmds:
+        s = settings.get(c) or {}
+        if s.get("schedule") == "daily" and c in SCHEDULABLE_COMMAND_KEYS:
+            daily.append((c, _parse_daily_time(s.get("daily_time"))))
+        else:
+            interval_cmds.append(c)
+    return interval_cmds, daily
+
 
 class LogRotator:
     """Handles log file rotation"""
     
-    def __init__(self, site_name: str, custom_log_dir: Optional[str] = None):
+    def __init__(
+        self,
+        site_name: str,
+        custom_log_dir: Optional[str] = None,
+        retention_days: int = DEFAULT_LOG_RETENTION_DAYS,
+    ):
         self.site_name = site_name
+        self.retention_days = max(0, min(MAX_LOG_RETENTION_DAYS, int(retention_days)))
         if custom_log_dir:
             self.site_dir = Path(custom_log_dir) / site_name
         else:
@@ -134,14 +200,16 @@ class LogRotator:
             f.write(message + '\n')
     
     def cleanup_old_logs(self):
-        """Remove logs older than retention period"""
-        cutoff_date = datetime.now(timezone.utc).timestamp() - (LOG_RETENTION_DAYS * 86400)
+        """Remove *.log files whose mtime is older than retention_days (UTC). 0 = disabled."""
+        if self.retention_days <= 0:
+            return
+        cutoff = datetime.now(timezone.utc).timestamp() - (self.retention_days * 86400)
         for log_file in self.site_dir.glob("*.log"):
-            if log_file.stat().st_mtime < cutoff_date:
-                try:
+            try:
+                if log_file.stat().st_mtime < cutoff:
                     log_file.unlink()
-                except:
-                    pass
+            except OSError:
+                pass
 
 
 class SiteConnection:
@@ -154,14 +222,19 @@ class SiteConnection:
         self.ignore_ssl = site_config.get("ignore_ssl", False)
         self.auto_start = site_config.get("auto_start", False)
         self.debug_mode = site_config.get("debug_mode", False)
-        self.commands = site_config.get("commands", DEFAULT_COMMANDS.copy())
+        self.interval_commands, self.daily_commands = split_commands_by_schedule(site_config)
+        self._daily_last_run: Dict[str, str] = {}
         self.custom_log_dir = site_config.get("log_dir", None)
         self.app = app
         self.websocket = None
         self.running = False
         self.authenticated = False
         self.command_ref = 0
-        self.log = LogRotator(self.site_name, self.custom_log_dir)
+        self.log = LogRotator(
+            self.site_name,
+            self.custom_log_dir,
+            retention_days=self.app.get_log_retention_days(),
+        )
         self.status = "Stopped"
         self.subscribed_categories = set()
         self.restart_attempts = 0
@@ -180,6 +253,20 @@ class SiteConnection:
             "zones": None,
             "tpos": None
         }
+
+    def _daily_fire(self, cmd: str, time_str: str, now_local: datetime) -> bool:
+        """True once per local calendar day when hour:minute matches scheduled time."""
+        try:
+            h, m = map(int, time_str.split(":"))
+        except ValueError:
+            return False
+        if now_local.hour != h or now_local.minute != m:
+            return False
+        key = now_local.date().isoformat()
+        if self._daily_last_run.get(cmd) == key:
+            return False
+        self._daily_last_run[cmd] = key
+        return True
     
     def _debug_log(self, message: str, data: any = None):
         """Log debug information if debug mode is enabled"""
@@ -1148,11 +1235,17 @@ class SiteConnection:
                 else:
                     self._log_to_gui("ℹ️ No notification subscriptions configured")
                 
-                # Use site-specific commands
-                commands = self.commands
-                
-                self._log_to_gui(f"Started. Will execute {len(commands)} command(s) every {self.app.get_interval()} minutes")
-                self._debug_log(f"Commands to execute: {commands}")
+                # Site-specific: interval vs daily (extended/historical)
+                interval_cmds = self.interval_commands
+                daily_specs = self.daily_commands
+                self._log_to_gui(
+                    f"Started. Interval: {len(interval_cmds)} cmd(s) every {self.app.get_interval()} min · "
+                    f"Daily: {len(daily_specs)} cmd(s) at local time"
+                )
+                self._debug_log(
+                    "Command plan",
+                    {"interval": interval_cmds, "daily": [f"{c}@{t}" for c, t in daily_specs]},
+                )
                 
                 receive_task = asyncio.create_task(self._receive_messages())
                 
@@ -1168,20 +1261,35 @@ class SiteConnection:
                     
                     while self.running:
                         current_time = asyncio.get_event_loop().time()
-                        
+                        now_local = datetime.now()
+
+                        # Once-per-day commands (extended/historical), local clock
+                        for cmd, time_str in self.daily_commands:
+                            if not self.running:
+                                break
+                            if self._daily_fire(cmd, time_str, now_local):
+                                if self.authenticated and self.connection_alive:
+                                    self._log_to_gui(f"📅 Daily run: {cmd} (scheduled {time_str} local)")
+                                    await self.execute_command(cmd)
+                                    await asyncio.sleep(1)
+
                         if current_time - last_command_time >= interval:
-                            self._log_to_gui(f"=== Starting command cycle ===")
-                            for cmd in commands:
+                            self._log_to_gui(f"=== Starting interval command cycle ===")
+                            self.log.retention_days = self.app.get_log_retention_days()
+                            self.log.cleanup_old_logs()
+                            for cmd in self.interval_commands:
                                 if self.running and self.authenticated and self.connection_alive:
                                     await self.execute_command(cmd)
                                     await asyncio.sleep(1)
                                 else:
                                     self._log_to_gui("Skipping commands - connection not ready")
                                     break
-                            
+
                             last_command_time = current_time
                             interval = self.app.get_interval() * 60
-                            self._log_to_gui(f"=== Command cycle complete. Next cycle in {self.app.get_interval()} minutes ===")
+                            self._log_to_gui(
+                                f"=== Interval cycle complete. Next in {self.app.get_interval()} minutes ==="
+                            )
                         
                         # Lightweight connection check every 30 seconds
                         if current_time - last_health_check >= 30:
@@ -1491,7 +1599,8 @@ class WBALoggerApp:
             return {
                 "sites": [],
                 "interval_minutes": 5,
-                "subscriptions": ["alerts"]
+                "subscriptions": ["alerts"],
+                "log_retention_days": DEFAULT_LOG_RETENTION_DAYS,
             }
         
         with open(CONFIG_FILE, 'r') as f:
@@ -1499,6 +1608,8 @@ class WBALoggerApp:
         
         if "subscriptions" not in config:
             config["subscriptions"] = ["alerts"]
+        if "log_retention_days" not in config:
+            config["log_retention_days"] = DEFAULT_LOG_RETENTION_DAYS
         
         # Migrate old configs: move global commands to each site
         if "commands" in config:
@@ -1511,6 +1622,7 @@ class WBALoggerApp:
         for site in config.get("sites", []):
             if "commands" not in site or not site["commands"]:
                 site["commands"] = DEFAULT_COMMANDS.copy()
+            migrate_site_command_settings(site)
         
         return config
     
@@ -1542,6 +1654,19 @@ class WBALoggerApp:
         if interval < 1 or interval > 60:
             errors.append(f"Invalid interval: {interval} (must be 1-60 minutes)")
             self.config["interval_minutes"] = max(1, min(60, interval))
+        
+        try:
+            lr = int(self.config.get("log_retention_days", DEFAULT_LOG_RETENTION_DAYS))
+        except (TypeError, ValueError):
+            lr = DEFAULT_LOG_RETENTION_DAYS
+            errors.append("Invalid log_retention_days; reset to default")
+        if lr < 0:
+            errors.append("log_retention_days cannot be negative (use 0 to disable auto-delete)")
+            lr = 0
+        if lr > MAX_LOG_RETENTION_DAYS:
+            errors.append(f"log_retention_days capped at {MAX_LOG_RETENTION_DAYS}")
+            lr = MAX_LOG_RETENTION_DAYS
+        self.config["log_retention_days"] = lr
         
         if errors:
             error_msg = "Configuration validation errors:\n\n" + "\n".join(f"• {e}" for e in errors)
@@ -1581,10 +1706,28 @@ class WBALoggerApp:
         interval_spin = ttk.Spinbox(interval_frame, from_=1, to=60, textvariable=self.interval_var, width=10)
         interval_spin.pack(side=tk.LEFT, padx=5)
         
-        ttk.Button(interval_frame, text="Save Interval", command=self.save_settings).pack(side=tk.LEFT, padx=20)
+        ttk.Button(interval_frame, text="Save global settings", command=self.save_settings).pack(side=tk.LEFT, padx=20)
         
         ttk.Label(interval_frame, text="(Commands are configured per-site)", 
                  font=('TkDefaultFont', 8, 'italic')).pack(side=tk.LEFT, padx=20)
+        
+        retention_frame = ttk.Frame(settings_frame)
+        retention_frame.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(retention_frame, text="Log retention (days):").pack(side=tk.LEFT, padx=5)
+        self.log_retention_var = tk.IntVar(value=int(self.config.get("log_retention_days", DEFAULT_LOG_RETENTION_DAYS)))
+        retention_spin = ttk.Spinbox(
+            retention_frame,
+            from_=0,
+            to=MAX_LOG_RETENTION_DAYS,
+            textvariable=self.log_retention_var,
+            width=10,
+        )
+        retention_spin.pack(side=tk.LEFT, padx=5)
+        ttk.Label(
+            retention_frame,
+            text="0 = never delete by age · 1+ = delete .log files older than this many days (each site folder)",
+            font=("TkDefaultFont", 8, "italic"),
+        ).pack(side=tk.LEFT, padx=(10, 0))
         
         # Subscriptions section
         subs_frame = ttk.LabelFrame(settings_frame, text="Alert Notifications", padding="10")
@@ -1657,7 +1800,7 @@ class WBALoggerApp:
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
         info_label = ttk.Label(main_frame, 
-                               text="Commands are configured per-site in Add/Edit Site dialog. Alert subscriptions are global settings.\n"
+                               text="Commands are configured per-site in Add/Edit Site dialog. Extended/historical commands can use the global interval or run once daily at a local HH:MM. Alert subscriptions are global.\n"
                                     "Baseline is established on first run. Changes to Zones/TPOs are logged as CRITICAL.\n"
                                     "Sites with Auto-Start enabled will reconnect automatically (up to 3 attempts). "
                                     "Toggle Debug to enable/disable verbose logging for running sites.\n"
@@ -1710,10 +1853,32 @@ class WBALoggerApp:
             self.log_activity(f"Debug mode {status} for '{site['name']}' (will take effect on next start)")
     
     def save_settings(self):
-        """Save interval settings"""
+        """Save global settings (interval, log retention)."""
         self.config["interval_minutes"] = self.interval_var.get()
+        try:
+            lr = int(self.log_retention_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            lr = DEFAULT_LOG_RETENTION_DAYS
+        self.config["log_retention_days"] = max(0, min(MAX_LOG_RETENTION_DAYS, lr))
+        self.log_retention_var.set(self.config["log_retention_days"])
         self.save_config()
-        self.log_activity(f"Settings saved. Interval: {self.interval_var.get()} minutes")
+        lr_note = (
+            "retention off (no age-based delete)"
+            if self.config["log_retention_days"] == 0
+            else f"delete logs older than {self.config['log_retention_days']} day(s)"
+        )
+        for site in self.config.get("sites", []):
+            try:
+                LogRotator(
+                    site["name"],
+                    site.get("log_dir"),
+                    retention_days=self.config["log_retention_days"],
+                ).cleanup_old_logs()
+            except OSError:
+                pass
+        self.log_activity(
+            f"Settings saved. Interval: {self.interval_var.get()} min · Logs: {lr_note}"
+        )
     
     def save_subscriptions(self):
         """Save subscription settings"""
@@ -1944,6 +2109,13 @@ class WBALoggerApp:
         """Get command interval"""
         return self.config.get("interval_minutes", 5)
     
+    def get_log_retention_days(self) -> int:
+        """Days to keep log files (mtime); 0 = do not delete by age."""
+        try:
+            return max(0, min(MAX_LOG_RETENTION_DAYS, int(self.config.get("log_retention_days", DEFAULT_LOG_RETENTION_DAYS))))
+        except (TypeError, ValueError):
+            return DEFAULT_LOG_RETENTION_DAYS
+    
     def get_subscriptions(self) -> list:
         """Get notification categories to subscribe to"""
         return self.config.get("subscriptions", [])
@@ -1985,21 +2157,22 @@ class SiteDialog(tk.Toplevel):
     def __init__(self, parent, title, site_data=None):
         super().__init__(parent)
         self.title(title)
-        self.geometry("700x700")
+        self.geometry("760x820")
         self.result = None
         
         self.transient(parent)
         self.grab_set()
         
         self.site_data = site_data or {
-            "name": "", 
-            "url": "", 
-            "token": "", 
-            "ignore_ssl": False, 
-            "auto_start": False, 
+            "name": "",
+            "url": "",
+            "token": "",
+            "ignore_ssl": False,
+            "auto_start": False,
             "debug_mode": False,
             "commands": DEFAULT_COMMANDS.copy(),
-            "log_dir": None
+            "command_settings": {},
+            "log_dir": None,
         }
         
         self.create_widgets()
@@ -2009,6 +2182,38 @@ class SiteDialog(tk.Toplevel):
         x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.winfo_width() // 2)
         y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.winfo_height() // 2)
         self.geometry(f"+{x}+{y}")
+
+    def _add_schedulable_command_row(
+        self, parent, cmd: str, desc: str, current_commands: list
+    ) -> None:
+        """Extended/historical: checkbox + interval vs daily + local time."""
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, padx=(10, 0), pady=2)
+        settings = self.site_data.get("command_settings") or {}
+        raw = settings.get(cmd)
+        s = raw if isinstance(raw, dict) else {}
+        mode = "daily" if s.get("schedule") == "daily" else "interval"
+        var = tk.BooleanVar(value=cmd in current_commands)
+        self.command_vars[cmd] = var
+        ttk.Checkbutton(row, text=f"{cmd} - {desc}", variable=var).pack(side=tk.LEFT)
+        mode_var = tk.StringVar(value=mode)
+        time_var = tk.StringVar(value=_parse_daily_time(s.get("daily_time")))
+        self.schedule_mode_vars[cmd] = mode_var
+        self.daily_time_vars[cmd] = time_var
+        ttk.Label(row, text="Run:").pack(side=tk.LEFT, padx=(12, 2))
+        combo = ttk.Combobox(
+            row, textvariable=mode_var, values=("interval", "daily"), width=9, state="readonly"
+        )
+        combo.pack(side=tk.LEFT)
+        ttk.Label(row, text="local HH:MM:").pack(side=tk.LEFT, padx=(8, 2))
+        time_entry = ttk.Entry(row, textvariable=time_var, width=7)
+        time_entry.pack(side=tk.LEFT)
+
+        def sync_time_state(*_: object) -> None:
+            time_entry.config(state=("normal" if mode_var.get() == "daily" else "disabled"))
+
+        mode_var.trace_add("write", lambda *_: sync_time_state())
+        sync_time_state()
     
     def create_widgets(self):
         """Create dialog widgets"""
@@ -2123,25 +2328,27 @@ class SiteDialog(tk.Toplevel):
             cb = ttk.Checkbutton(cmd_frame, text=f"{cmd} - {desc}", variable=var)
             cb.pack(anchor=tk.W, padx=(10, 0), pady=1)
         
-        # Extended commands
+        self.schedule_mode_vars: Dict[str, tk.StringVar] = {}
+        self.daily_time_vars: Dict[str, tk.StringVar] = {}
+
+        # Extended commands (optional: daily at fixed local time)
         ext_label = ttk.Label(cmd_frame, text="Extended Monitoring:", font=('TkDefaultFont', 9, 'bold'))
         ext_label.pack(anchor=tk.W, pady=(10, 2))
-        
+        ttk.Label(
+            cmd_frame,
+            text="↳ Each command: run on every global interval, or once per day at the local time you set.",
+            font=('TkDefaultFont', 8, 'italic'),
+        ).pack(anchor=tk.W, padx=(10, 0))
+
         for cmd, desc in AVAILABLE_COMMANDS["extended"]:
-            var = tk.BooleanVar(value=cmd in current_commands)
-            self.command_vars[cmd] = var
-            cb = ttk.Checkbutton(cmd_frame, text=f"{cmd} - {desc}", variable=var)
-            cb.pack(anchor=tk.W, padx=(10, 0), pady=1)
-        
+            self._add_schedulable_command_row(cmd_frame, cmd, desc, current_commands)
+
         # Historical commands
         hist_label = ttk.Label(cmd_frame, text="Historical Data (High Volume):", font=('TkDefaultFont', 9, 'bold'))
         hist_label.pack(anchor=tk.W, pady=(10, 2))
-        
+
         for cmd, desc in AVAILABLE_COMMANDS["historical"]:
-            var = tk.BooleanVar(value=cmd in current_commands)
-            self.command_vars[cmd] = var
-            cb = ttk.Checkbutton(cmd_frame, text=f"{cmd} - {desc}", variable=var)
-            cb.pack(anchor=tk.W, padx=(10, 0), pady=1)
+            self._add_schedulable_command_row(cmd_frame, cmd, desc, current_commands)
         
         ttk.Label(cmd_frame, text="⚠️ Historical commands may retrieve large datasets and increase log size significantly", 
                  font=('TkDefaultFont', 8, 'italic'), foreground='red').pack(anchor=tk.W, pady=(5, 0))
@@ -2201,6 +2408,19 @@ class SiteDialog(tk.Toplevel):
         if not selected_commands:
             messagebox.showerror("Error", "At least one monitoring command must be selected")
             return
+
+        command_settings: Dict[str, Dict] = {}
+        for cmd in selected_commands:
+            if cmd in self.schedule_mode_vars and cmd in self.daily_time_vars:
+                if self.schedule_mode_vars[cmd].get() == "daily":
+                    command_settings[cmd] = {
+                        "schedule": "daily",
+                        "daily_time": _parse_daily_time(self.daily_time_vars[cmd].get()),
+                    }
+                else:
+                    command_settings[cmd] = {"schedule": "interval"}
+            else:
+                command_settings[cmd] = {"schedule": "interval"}
         
         log_dir = self.log_dir_var.get().strip() or None
         
@@ -2212,6 +2432,7 @@ class SiteDialog(tk.Toplevel):
             "auto_start": self.auto_start_var.get(),
             "debug_mode": self.debug_var.get(),
             "commands": selected_commands,
+            "command_settings": command_settings,
             "log_dir": log_dir
         }
         

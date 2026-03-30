@@ -18,6 +18,7 @@ def test_site_config_defaults():
 def test_agent_config_defaults():
     config = AgentConfig.from_dict({"sites": []})
     assert config.interval_minutes == 5
+    assert config.log_retention_days == 365
     assert config.subscriptions == ["alerts"]
     assert config.control_plane is None
 
@@ -36,6 +37,7 @@ def test_agent_config_serialization(tmp_path):
     loaded = load_config(path)
 
     assert loaded.interval_minutes == config.interval_minutes
+    assert loaded.log_retention_days == config.log_retention_days
     assert loaded.sites[0].name == "A"
     assert loaded.control_plane is None
 

@@ -81,6 +81,7 @@ class AgentConfig:
     """Top-level configuration for the collector agent."""
 
     interval_minutes: int = 5
+    log_retention_days: int = 365
     subscriptions: List[str] = field(default_factory=lambda: ["alerts"])
     sites: List[SiteConfig] = field(default_factory=list)
     control_plane: Optional[ControlPlaneConfig] = None
@@ -88,6 +89,11 @@ class AgentConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AgentConfig":
         interval = data.get("interval_minutes", 5)
+        lr = data.get("log_retention_days", 365)
+        try:
+            log_retention_days = max(0, min(3650, int(lr)))
+        except (TypeError, ValueError):
+            log_retention_days = 365
         subscriptions = data.get("subscriptions") or ["alerts"]
         sites = [SiteConfig.from_dict(site) for site in data.get("sites", [])]
         control_plane_data = data.get("control_plane")
@@ -99,6 +105,7 @@ class AgentConfig:
             )
         return cls(
             interval_minutes=int(interval),
+            log_retention_days=log_retention_days,
             subscriptions=list(subscriptions),
             sites=sites,
             control_plane=control_plane,
@@ -139,6 +146,7 @@ def save_config(config: AgentConfig, path: Path) -> None:
 
     data: Dict[str, Any] = {
         "interval_minutes": config.interval_minutes,
+        "log_retention_days": config.log_retention_days,
         "subscriptions": config.subscriptions,
         "sites": [
             {

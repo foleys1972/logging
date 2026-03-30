@@ -38,6 +38,7 @@ class AgentRunner:
                 self.event_bus,
                 self.control_plane_client,
                 subscriptions=list(self.config.subscriptions),
+                log_retention_days=self.config.log_retention_days,
             )
             self.connections.append(conn)
             if site.auto_start:

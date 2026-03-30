@@ -28,12 +28,14 @@ class SiteConnection:
         event_bus: EventBus,
         control_plane_client: Optional[ControlPlaneClient] = None,
         subscriptions: Optional[List[str]] = None,
+        log_retention_days: int = 365,
     ) -> None:
         self.cfg = config
         self.event_bus = event_bus
         self.control_plane_client = control_plane_client
         self.subscriptions = list(subscriptions or [])
         self.subscribed_categories: set[str] = set()
+        self._log_retention_days = max(0, min(3650, int(log_retention_days)))
 
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.running: bool = False
@@ -49,7 +51,11 @@ class SiteConnection:
         self.max_restart_attempts: int = 3
         self.last_activity: Optional[float] = None
 
-        self.log = LogRotator(config.name, Path(config.log_dir) if config.log_dir else None)
+        self.log = LogRotator(
+            config.name,
+            Path(config.log_dir) if config.log_dir else None,
+            retention_days=self._log_retention_days,
+        )
         self.baseline = {"zones": None, "tpos": None}
 
     async def run(self) -> None:
@@ -265,6 +271,8 @@ class SiteConnection:
             current_time = asyncio.get_event_loop().time()
 
             if current_time - last_command_time >= interval_seconds:
+                self.log.retention_days = self._log_retention_days
+                self.log.cleanup()
                 commands = self.cfg.commands
                 await self._notify("cycle_started", {"commands": commands})
                 for command in commands:
