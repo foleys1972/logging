@@ -9,7 +9,7 @@ Features:
 - Periodic command execution
 - Automatic multi-batch response handling for get_users, get_calls, get_events
 - 10MB WebSocket frame size limit (handles large batches)
-- Command responses logged as JSON (size cap on disk only; WBA batches are merged in full first)
+- Command responses logged as full JSON (WBA batches are merged in full before logging)
 - Debug mode logs ALL messages (requests, timing, notifications, etc.)
 - Server-managed keepalive (server pings every 5s per API default)
 - Passive connection monitoring (checks state, doesn't interfere with server pings)
@@ -33,7 +33,7 @@ Alert Notifications:
 - Notifications appear in both GUI and log files
 
 Logging Behavior:
-- Normal mode: Command responses with full JSON data (truncated in log file if over cap; see MAX_COMMAND_LOG_JSON_BYTES)
+- Normal mode: Command responses with full JSON data (no truncation)
 - Debug mode: Everything above + request details, timing, all notifications, detailed errors
 
 Important: The server manages connection keepalive via ping frames (default 5 seconds).
@@ -53,13 +53,10 @@ from datetime import datetime, timezone
 from typing import Dict, Optional, List, Tuple
 import threading
 import time
-
 # Constants
 CONFIG_FILE = "wba_config.json"
 LOG_BASE_DIR = "logs"
 MAX_LOG_SIZE = 50 * 1024 * 1024  # 50MB
-# Max JSON size written per COMMAND log entry (API data is fully received/merged before this)
-MAX_COMMAND_LOG_JSON_BYTES = 1024 * 1024  # 1 MiB
 DEFAULT_LOG_RETENTION_DAYS = 365
 MAX_LOG_RETENTION_DAYS = 3650
 
@@ -345,50 +342,7 @@ class SiteConnection:
         
         if should_write_data:
             try:
-                json_str = json.dumps(full_data)
-                if len(json_str) > MAX_COMMAND_LOG_JSON_BYTES:
-                    data = full_data.get("data", {})
-                    if not isinstance(data, dict):
-                        data = {}
-                    truncated = {
-                        "_note": (
-                            "Log file JSON size cap — the client already received and merged all WBA response "
-                            "batches (current_batch / last_batch). Counts below are from the full merged result."
-                        ),
-                        "_log_cap_bytes": MAX_COMMAND_LOG_JSON_BYTES,
-                        "_serialized_size_bytes": len(json_str),
-                        "command": full_data.get("command"),
-                        "success": full_data.get("success"),
-                        "data_keys": list(data.keys()) if data else None,
-                    }
-                    for k in ("current_batch", "last_batch"):
-                        if k in data:
-                            truncated[k] = data.get(k)
-                    # Add count information if available (merged lists)
-                    if "users" in data:
-                        truncated["user_count"] = len(data.get("users", []))
-                    elif "calls" in data:
-                        truncated["call_count"] = len(data.get("calls", []))
-                    elif "events" in data:
-                        truncated["event_count"] = len(data.get("events", []))
-                    elif "turrets" in data:
-                        truncated["turret_count"] = len(data.get("turrets", []))
-                    elif "zones" in data:
-                        truncated["zone_count"] = len(data.get("zones", []))
-                    elif "tpos" in data:
-                        truncated["tpo_count"] = len(data.get("tpos", []))
-                    elif "lines" in data:
-                        truncated["line_count"] = len(data.get("lines", []))
-                    elif "sharedprofiles" in data:
-                        truncated["profile_count"] = len(data.get("sharedprofiles", []))
-                    
-                    self.log.write(json.dumps(truncated))
-                    self.log.write(
-                        f"[Serialized COMMAND response was {len(json_str)} bytes — "
-                        f"log stores summary only; cap {MAX_COMMAND_LOG_JSON_BYTES} bytes]"
-                    )
-                else:
-                    self.log.write(json_str)
+                self.log.write(json.dumps(full_data))
             except Exception as e:
                 self.log.write(f"[Error serializing response: {str(e)}]")
     
