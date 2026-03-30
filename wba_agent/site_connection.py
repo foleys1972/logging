@@ -299,7 +299,8 @@ class SiteConnection:
                 args["category"] = parts[1]
 
         if base_command == "get_users":
-            args["get_lines_info"] = "true" if self.cfg.get_lines_info else "false"
+            # WBA spec: boolean; strings "true"/"false" are rejected as wrong type
+            args["get_lines_info"] = bool(self.cfg.get_lines_info)
 
         for attempt in range(3):
             cmd_ref = None
