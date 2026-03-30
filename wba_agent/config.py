@@ -49,6 +49,7 @@ class SiteConfig:
     ignore_ssl: bool = False
     auto_start: bool = False
     debug_mode: bool = False
+    get_lines_info: bool = True
     interval_minutes: Optional[int] = None
     log_dir: Optional[str] = None
     control_plane_site_id: Optional[int] = None
@@ -64,6 +65,7 @@ class SiteConfig:
             ignore_ssl=data.get("ignore_ssl", False),
             auto_start=data.get("auto_start", False),
             debug_mode=data.get("debug_mode", False),
+            get_lines_info=bool(data.get("get_lines_info", True)),
             interval_minutes=data.get("interval_minutes"),
             log_dir=data.get("log_dir"),
             control_plane_site_id=data.get("control_plane_site_id"),

@@ -226,15 +226,15 @@ class SiteConnection:
 
         merged_any = False
         for key in WBA_BATCH_MERGE_LIST_KEYS:
-            if key not in data or not isinstance(data.get(key), list):
-                continue
-            merged_any = True
-            all_items = list(data[key])
+            items_first = list(data[key]) if isinstance(data.get(key), list) else []
+            extra: List[Any] = []
             for batch in batches:
                 bd = batch.get("data", {})
                 if isinstance(bd, dict) and isinstance(bd.get(key), list):
-                    all_items.extend(bd[key])
-            data[key] = all_items
+                    extra.extend(bd[key])
+            if items_first or extra:
+                data[key] = items_first + extra
+                merged_any = True
 
         if merged_any:
             lb = batch_info.get("last_batch")
@@ -297,6 +297,9 @@ class SiteConnection:
             base_command = parts[0]
             if base_command == "get_events":
                 args["category"] = parts[1]
+
+        if base_command == "get_users":
+            args["get_lines_info"] = "true" if self.cfg.get_lines_info else "false"
 
         for attempt in range(3):
             cmd_ref = None
@@ -444,10 +447,7 @@ class SiteConnection:
             if last is not None:
                 batch_info["last_batch"] = last
             batch_info["batches"].append(data)
-            lb = batch_info.get("last_batch")
             if cur is not None and last is not None and cur == last:
-                batch_info["complete"] = True
-            elif lb is not None and lb > 1 and len(batch_info["batches"]) >= lb - 1:
                 batch_info["complete"] = True
 
     async def _handle_server_notification(self, data: Dict[str, Any]) -> None:

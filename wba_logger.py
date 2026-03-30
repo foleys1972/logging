@@ -33,7 +33,7 @@ Alert Notifications:
 - Notifications appear in both GUI and log files
 
 Logging Behavior:
-- Normal mode: Command responses with full JSON data (no truncation)
+- Normal mode: Command responses as JSON (get_users: summary line + envelope + one JSON line per user)
 - Debug mode: Everything above + request details, timing, all notifications, detailed errors
 
 Important: The server manages connection keepalive via ping frames (default 5 seconds).
@@ -295,6 +295,8 @@ class SiteConnection:
             "zones": None,
             "tpos": None
         }
+        # WBA get_users: include profile.lines etc. when true (API string "true"/"false")
+        self.get_lines_info = bool(site_config.get("get_lines_info", True))
 
     def _daily_fire(self, cmd: str, time_str: str, now_local: datetime) -> bool:
         """True once per local calendar day when hour:minute matches scheduled time."""
@@ -359,9 +361,45 @@ class SiteConnection:
         
         if should_write_data:
             try:
-                self.log.write(json.dumps(full_data))
+                self.log.write(json.dumps(full_data, ensure_ascii=False))
             except Exception as e:
                 self.log.write(f"[Error serializing response: {str(e)}]")
+
+    def _write_log_get_users(
+        self, command: str, data_summary: str, response_data: Dict
+    ) -> None:
+        """Log summary line, then envelope JSON (no users array), then one JSON line per user."""
+        timestamp = self._timestamp()
+        self.log.write(f"[{timestamp}] [COMMAND] [{command}] | {data_summary}")
+        data = response_data.get("data", {})
+        users: List = []
+        if isinstance(data, dict):
+            u = data.get("users")
+            if isinstance(u, list):
+                users = u
+            rest = {k: v for k, v in data.items() if k != "users"}
+            rest["user_count"] = len(users)
+            envelope = {
+                "command": response_data.get("command"),
+                "success": response_data.get("success"),
+                "command_ref": response_data.get("command_ref"),
+                "data": rest,
+            }
+            if response_data.get("error") is not None:
+                envelope["error"] = response_data.get("error")
+        else:
+            envelope = {
+                "command": response_data.get("command"),
+                "success": response_data.get("success"),
+                "data": data,
+            }
+        try:
+            self.log.write(json.dumps(envelope, ensure_ascii=False))
+            self.log.write("[get_users: one JSON object per line below]")
+            for u in users:
+                self.log.write(json.dumps(u, ensure_ascii=False))
+        except Exception as e:
+            self.log.write(f"[Error serializing get_users lines: {str(e)}]")
     
     def _log_to_gui(self, message: str):
         """Log message to GUI"""
@@ -854,7 +892,10 @@ class SiteConnection:
             base_command = parts[0]
             if base_command == "get_events":
                 args["category"] = parts[1]
-        
+
+        if base_command == "get_users":
+            args["get_lines_info"] = "true" if self.get_lines_info else "false"
+
         for attempt in range(3):
             cmd_ref = None
             try:
@@ -1137,15 +1178,15 @@ class SiteConnection:
 
         merged_any = False
         for key in WBA_BATCH_MERGE_LIST_KEYS:
-            if key not in data or not isinstance(data.get(key), list):
-                continue
-            merged_any = True
-            all_items = list(data[key])
+            items_first = list(data[key]) if isinstance(data.get(key), list) else []
+            extra: List = []
             for batch in batches:
                 batch_data = batch.get("data", {})
                 if isinstance(batch_data, dict) and isinstance(batch_data.get(key), list):
-                    all_items.extend(batch_data[key])
-            data[key] = all_items
+                    extra.extend(batch_data[key])
+            if items_first or extra:
+                data[key] = items_first + extra
+                merged_any = True
 
         if merged_any:
             data["current_batch"] = batch_info.get("last_batch", 1)
@@ -1426,16 +1467,6 @@ class SiteConnection:
                             if cur_b is not None and last_b is not None and cur_b == last_b:
                                 batch_info["complete"] = True
                                 self._debug_log(f"All batches complete for {cmd_ref}")
-                            elif (
-                                lb is not None
-                                and lb > 1
-                                and len(batch_info["batches"]) >= lb - 1
-                            ):
-                                # Fallback when paging indices are missing on the last page(s)
-                                batch_info["complete"] = True
-                                self._debug_log(
-                                    f"All batches complete for {cmd_ref} (by count {len(batch_info['batches'])}/{lb - 1} follow-ups)"
-                                )
                     
                     # Handle notifications
                     elif data.get("command") == "notify":
@@ -1613,6 +1644,8 @@ class WBALoggerApp:
             if "commands" not in site or not site["commands"]:
                 site["commands"] = DEFAULT_COMMANDS.copy()
             migrate_site_command_settings(site)
+            if "get_lines_info" not in site:
+                site["get_lines_info"] = True
         
         return config
     
@@ -2160,6 +2193,7 @@ class SiteDialog(tk.Toplevel):
             "ignore_ssl": False,
             "auto_start": False,
             "debug_mode": False,
+            "get_lines_info": True,
             "commands": DEFAULT_COMMANDS.copy(),
             "command_settings": {},
             "log_dir": None,
@@ -2297,6 +2331,39 @@ class SiteDialog(tk.Toplevel):
         ttk.Label(options_frame, text="↳ Leave empty to use default location (./logs)", 
                  font=('TkDefaultFont', 8, 'italic'),
                  foreground='gray').pack(anchor=tk.W, padx=(20, 0))
+
+        get_users_frame = ttk.LabelFrame(
+            scrollable_frame,
+            text="get_users: with or without line information",
+            padding="10",
+        )
+        get_users_frame.pack(fill=tk.X, pady=(0, 10))
+        self.get_lines_mode = tk.StringVar(
+            value="with_lines" if self.site_data.get("get_lines_info", True) else "without_lines"
+        )
+        ttk.Label(
+            get_users_frame,
+            text="Sets WBA argument get_lines_info on every get_users request:",
+            font=('TkDefaultFont', 9),
+        ).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Radiobutton(
+            get_users_frame,
+            text="With line information — profile.lines and line details (get_lines_info = true)",
+            variable=self.get_lines_mode,
+            value="with_lines",
+        ).pack(anchor=tk.W, pady=3)
+        ttk.Radiobutton(
+            get_users_frame,
+            text="Without line information — lighter user records, no profile.lines (get_lines_info = false)",
+            variable=self.get_lines_mode,
+            value="without_lines",
+        ).pack(anchor=tk.W, pady=3)
+        ttk.Label(
+            get_users_frame,
+            text="Restart the site after changing this so the next connection uses the new setting.",
+            font=('TkDefaultFont', 8, 'italic'),
+            foreground='gray',
+        ).pack(anchor=tk.W, pady=(10, 0))
         
         # Command selection
         cmd_frame = ttk.LabelFrame(scrollable_frame, text="Monitoring Commands", padding="10")
@@ -2361,6 +2428,9 @@ class SiteDialog(tk.Toplevel):
         self.ignore_ssl_var.set(self.site_data.get("ignore_ssl", False))
         self.auto_start_var.set(self.site_data.get("auto_start", False))
         self.debug_var.set(self.site_data.get("debug_mode", False))
+        self.get_lines_mode.set(
+            "with_lines" if self.site_data.get("get_lines_info", True) else "without_lines"
+        )
     
     def toggle_token(self):
         """Toggle token visibility"""
@@ -2421,6 +2491,7 @@ class SiteDialog(tk.Toplevel):
             "ignore_ssl": self.ignore_ssl_var.get(),
             "auto_start": self.auto_start_var.get(),
             "debug_mode": self.debug_var.get(),
+            "get_lines_info": self.get_lines_mode.get() == "with_lines",
             "commands": selected_commands,
             "command_settings": command_settings,
             "log_dir": log_dir
