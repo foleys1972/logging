@@ -1,0 +1,36 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local secrets & config (copy wba_config.json from a private backup)
+.wba_key
+wba_config.json
+
+# Logs & databases
+logs/
+*.log
+*.sqlite
+*.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Node / dashboard
+node_modules/
+**/node_modules/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.cursor/
