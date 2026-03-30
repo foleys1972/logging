@@ -250,6 +250,31 @@ class SiteConnection:
         combined["data"] = data
         return combined
 
+    @staticmethod
+    def _accumulate_users_from_batch_message(batch_info: Dict[str, Any], message: Dict[str, Any]) -> None:
+        pl = message.get("data", {})
+        if not isinstance(pl, dict):
+            return
+        users = pl.get("users")
+        if not isinstance(users, list) or not users:
+            return
+        batch_info.setdefault("accumulated_users", []).extend(users)
+
+    def _apply_accumulated_users_to_response(self, cmd_ref: str, response_data: Dict[str, Any]) -> None:
+        bi = self.pending_batches.get(cmd_ref)
+        if not bi:
+            return
+        acc = bi.get("accumulated_users") or []
+        if not acc:
+            return
+        d = response_data.get("data")
+        if not isinstance(d, dict):
+            response_data["data"] = {"users": list(acc)}
+            return
+        merged = dict(d)
+        merged["users"] = list(acc)
+        response_data["data"] = merged
+
     async def _resubscribe_notifications_after_reauth(self) -> None:
         """WBA spec: after re-authentication, subscribe again to notification categories."""
         for category in self.subscriptions:
@@ -311,7 +336,12 @@ class SiteConnection:
 
                 future: "asyncio.Future[Dict[str, Any]]" = asyncio.Future()
                 self.pending_responses[cmd_ref] = future
-                self.pending_batches[cmd_ref] = {"batches": [], "last_batch": None, "complete": False}
+                self.pending_batches[cmd_ref] = {
+                    "batches": [],
+                    "last_batch": None,
+                    "complete": False,
+                    "accumulated_users": [],
+                }
 
                 await self.websocket.send(json.dumps(msg))
 
@@ -334,6 +364,7 @@ class SiteConnection:
                             await asyncio.sleep(0.1)
                         if self.pending_batches[cmd_ref]["batches"]:
                             response = self._combine_batches(cmd_ref, response)
+                    self._apply_accumulated_users_to_response(cmd_ref, response)
                 except asyncio.TimeoutError:
                     self.pending_responses.pop(cmd_ref, None)
                     self.pending_batches.pop(cmd_ref, None)
@@ -430,14 +461,18 @@ class SiteConnection:
                     return
                 batch_info["last_batch"] = last
                 if cur == 1:
+                    self._accumulate_users_from_batch_message(batch_info, data)
                     self.pending_responses.pop(cmd_ref, None)
                     if not future.done():
                         future.set_result(data)
                 else:
+                    self._accumulate_users_from_batch_message(batch_info, data)
                     batch_info["batches"].append(data)
                 if cur == last:
                     batch_info["complete"] = True
                 return
+            if cmd_ref in self.pending_batches:
+                self._accumulate_users_from_batch_message(self.pending_batches[cmd_ref], data)
             self.pending_responses.pop(cmd_ref, None)
             if not future.done():
                 future.set_result(data)
@@ -447,6 +482,7 @@ class SiteConnection:
             batch_info = self.pending_batches[cmd_ref]
             if last is not None:
                 batch_info["last_batch"] = last
+            self._accumulate_users_from_batch_message(batch_info, data)
             batch_info["batches"].append(data)
             if cur is not None and last is not None and cur == last:
                 batch_info["complete"] = True

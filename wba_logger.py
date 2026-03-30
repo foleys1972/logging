@@ -50,7 +50,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 import threading
 import time
 # Constants
@@ -101,6 +101,17 @@ WBA_BATCH_MERGE_LIST_KEYS = (
     "tpos",
     "zones",
 )
+
+
+def _user_json_line_login_first(user: Any) -> str:
+    """One compact JSON line per user; always starts with {\"login\":...} (null if missing)."""
+    if not isinstance(user, dict):
+        return json.dumps({"_value": user}, ensure_ascii=False, separators=(",", ":"))
+    ordered: Dict[str, Any] = {"login": user.get("login")}
+    for k, v in user.items():
+        if k != "login":
+            ordered[k] = v
+    return json.dumps(ordered, ensure_ascii=False, separators=(",", ":"))
 
 
 # Available WBA commands
@@ -368,7 +379,7 @@ class SiteConnection:
     def _write_log_get_users(
         self, command: str, data_summary: str, response_data: Dict
     ) -> None:
-        """Log summary line, then envelope JSON (no users array), then one JSON line per user."""
+        """Summary line, compact meta, marker, then one line per user starting with {\"login\":...}."""
         timestamp = self._timestamp()
         self.log.write(f"[{timestamp}] [COMMAND] [{command}] | {data_summary}")
         data = response_data.get("data", {})
@@ -377,29 +388,62 @@ class SiteConnection:
             u = data.get("users")
             if isinstance(u, list):
                 users = u
-            rest = {k: v for k, v in data.items() if k != "users"}
-            rest["user_count"] = len(users)
-            envelope = {
+            meta = {
                 "command": response_data.get("command"),
                 "success": response_data.get("success"),
                 "command_ref": response_data.get("command_ref"),
-                "data": rest,
+                "data": {
+                    k: v
+                    for k, v in data.items()
+                    if k != "users"
+                },
             }
-            if response_data.get("error") is not None:
-                envelope["error"] = response_data.get("error")
+            meta["data"]["user_count"] = len(users)
         else:
-            envelope = {
+            meta = {
                 "command": response_data.get("command"),
                 "success": response_data.get("success"),
                 "data": data,
             }
         try:
-            self.log.write(json.dumps(envelope, ensure_ascii=False))
-            self.log.write("[get_users: one JSON object per line below]")
+            self.log.write(json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
+            self.log.write(
+                "[get_users users JSONL — each line is one user object; each line begins with {\"login\":...}]"
+            )
+            self.log.write(
+                "[get_users note] Rows are from WBA only; blocked or policy-excluded users may be omitted by the server."
+            )
             for u in users:
-                self.log.write(json.dumps(u, ensure_ascii=False))
+                self.log.write(_user_json_line_login_first(u))
         except Exception as e:
             self.log.write(f"[Error serializing get_users lines: {str(e)}]")
+
+    @staticmethod
+    def _accumulate_users_from_batch_message(batch_info: dict, message: dict) -> None:
+        """Etsv3-style: extend with users[] from every batch page (same command_ref)."""
+        pl = message.get("data", {})
+        if not isinstance(pl, dict):
+            return
+        users = pl.get("users")
+        if not isinstance(users, list) or not users:
+            return
+        batch_info.setdefault("accumulated_users", []).extend(users)
+
+    def _apply_accumulated_users_to_response(self, cmd_ref: str, response_data: dict) -> None:
+        """Replace data.users with concatenation of all pages' users before pending_batches is cleared."""
+        bi = self.pending_batches.get(cmd_ref)
+        if not bi:
+            return
+        acc = bi.get("accumulated_users") or []
+        if not acc:
+            return
+        d = response_data.get("data")
+        if not isinstance(d, dict):
+            response_data["data"] = {"users": list(acc)}
+            return
+        merged = dict(d)
+        merged["users"] = list(acc)
+        response_data["data"] = merged
     
     def _log_to_gui(self, message: str):
         """Log message to GUI"""
@@ -916,7 +960,8 @@ class SiteConnection:
                 self.pending_batches[cmd_ref] = {
                     "batches": [],
                     "last_batch": None,
-                    "complete": False
+                    "complete": False,
+                    "accumulated_users": [],
                 }
                 
                 send_time = asyncio.get_event_loop().time()
@@ -957,7 +1002,10 @@ class SiteConnection:
                             total_time = asyncio.get_event_loop().time() - send_time
                             self._debug_log(f"All {last_batch} batches received for {command} in {total_time:.3f}s")
                             self._log_to_gui(f"✓ {command} - Received all {last_batch} batches")
-                    
+
+                    # Concatenate users from every page (receive order) before finally clears batch state
+                    self._apply_accumulated_users_to_response(cmd_ref, response_data)
+
                 except asyncio.TimeoutError:
                     self.pending_responses.pop(cmd_ref, None)
                     self.pending_batches.pop(cmd_ref, None)
@@ -1439,10 +1487,12 @@ class SiteConnection:
                                 batch_info = self.pending_batches[cmd_ref]
                                 batch_info["last_batch"] = last_b
                                 if cur_b == 1:
+                                    self._accumulate_users_from_batch_message(batch_info, data)
                                     future = self.pending_responses.pop(cmd_ref)
                                     if not future.done():
                                         future.set_result(data)
                                 else:
+                                    self._accumulate_users_from_batch_message(batch_info, data)
                                     batch_info["batches"].append(data)
                                     self._debug_log(f"Received batch {cur_b}/{last_b} for {cmd_ref}")
                                     self._log_to_gui(f"📦 Batch {cur_b}/{last_b} received")
@@ -1450,6 +1500,10 @@ class SiteConnection:
                                     batch_info["complete"] = True
                                     self._debug_log(f"All batches complete for {cmd_ref}")
                             else:
+                                if cmd_ref in self.pending_batches:
+                                    self._accumulate_users_from_batch_message(
+                                        self.pending_batches[cmd_ref], data
+                                    )
                                 future = self.pending_responses.pop(cmd_ref)
                                 if not future.done():
                                     future.set_result(data)
@@ -1461,6 +1515,7 @@ class SiteConnection:
                             batch_info = self.pending_batches[cmd_ref]
                             if last_b is not None:
                                 batch_info["last_batch"] = last_b
+                            self._accumulate_users_from_batch_message(batch_info, data)
                             batch_info["batches"].append(data)
                             self._debug_log(f"Received follow-up batch for {cmd_ref} (page {cur_b}/{last_b})")
                             self._log_to_gui(f"📦 Batch {cur_b or '?'}/{last_b or '?'} received")
