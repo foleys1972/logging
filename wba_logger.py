@@ -9,7 +9,7 @@ Features:
 - Periodic command execution
 - Automatic multi-batch response handling for get_users, get_calls, get_events
 - 10MB WebSocket frame size limit (handles large batches)
-- Command responses always logged (with smart 100KB truncation)
+- Command responses logged as JSON (size cap on disk only; WBA batches are merged in full first)
 - Debug mode logs ALL messages (requests, timing, notifications, etc.)
 - Server-managed keepalive (server pings every 5s per API default)
 - Passive connection monitoring (checks state, doesn't interfere with server pings)
@@ -33,7 +33,7 @@ Alert Notifications:
 - Notifications appear in both GUI and log files
 
 Logging Behavior:
-- Normal mode: Command responses with full JSON data (truncated if >100KB)
+- Normal mode: Command responses with full JSON data (truncated in log file if over cap; see MAX_COMMAND_LOG_JSON_BYTES)
 - Debug mode: Everything above + request details, timing, all notifications, detailed errors
 
 Important: The server manages connection keepalive via ping frames (default 5 seconds).
@@ -58,8 +58,36 @@ import time
 CONFIG_FILE = "wba_config.json"
 LOG_BASE_DIR = "logs"
 MAX_LOG_SIZE = 50 * 1024 * 1024  # 50MB
+# Max JSON size written per COMMAND log entry (API data is fully received/merged before this)
+MAX_COMMAND_LOG_JSON_BYTES = 1024 * 1024  # 1 MiB
 DEFAULT_LOG_RETENTION_DAYS = 365
 MAX_LOG_RETENTION_DAYS = 3650
+
+
+def _coerce_batch_num(value) -> Optional[int]:
+    """WBA may send current_batch/last_batch as int or string."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# `data` payload list keys merged across multi-batch responses (TradeSense WBA paging).
+# Covers extended monitoring: get_users, get_turrets, get_lines, get_shared_profiles;
+# plus historical (calls, events) and core commands if the server batches them.
+WBA_BATCH_MERGE_LIST_KEYS = (
+    "users",
+    "turrets",
+    "lines",
+    "sharedprofiles",
+    "calls",
+    "events",
+    "tpos",
+    "zones",
+)
+
 
 # Available WBA commands
 AVAILABLE_COMMANDS = {
@@ -318,17 +346,25 @@ class SiteConnection:
         if should_write_data:
             try:
                 json_str = json.dumps(full_data)
-                # Limit to 100KB per JSON entry to prevent huge log files
-                if len(json_str) > 100000:
+                if len(json_str) > MAX_COMMAND_LOG_JSON_BYTES:
+                    data = full_data.get("data", {})
+                    if not isinstance(data, dict):
+                        data = {}
                     truncated = {
-                        "_note": "Response truncated due to size",
-                        "_size_bytes": len(json_str),
+                        "_note": (
+                            "Log file JSON size cap — the client already received and merged all WBA response "
+                            "batches (current_batch / last_batch). Counts below are from the full merged result."
+                        ),
+                        "_log_cap_bytes": MAX_COMMAND_LOG_JSON_BYTES,
+                        "_serialized_size_bytes": len(json_str),
                         "command": full_data.get("command"),
                         "success": full_data.get("success"),
-                        "data_keys": list(full_data.get("data", {}).keys()) if isinstance(full_data.get("data"), dict) else None
+                        "data_keys": list(data.keys()) if data else None,
                     }
-                    # Add count information if available
-                    data = full_data.get("data", {})
+                    for k in ("current_batch", "last_batch"):
+                        if k in data:
+                            truncated[k] = data.get(k)
+                    # Add count information if available (merged lists)
                     if "users" in data:
                         truncated["user_count"] = len(data.get("users", []))
                     elif "calls" in data:
@@ -343,9 +379,14 @@ class SiteConnection:
                         truncated["tpo_count"] = len(data.get("tpos", []))
                     elif "lines" in data:
                         truncated["line_count"] = len(data.get("lines", []))
+                    elif "sharedprofiles" in data:
+                        truncated["profile_count"] = len(data.get("sharedprofiles", []))
                     
                     self.log.write(json.dumps(truncated))
-                    self.log.write(f"[Full response size: {len(json_str)} bytes - truncated for log size management]")
+                    self.log.write(
+                        f"[Serialized COMMAND response was {len(json_str)} bytes — "
+                        f"log stores summary only; cap {MAX_COMMAND_LOG_JSON_BYTES} bytes]"
+                    )
                 else:
                     self.log.write(json_str)
             except Exception as e:
@@ -876,18 +917,18 @@ class SiteConnection:
                     response_time = asyncio.get_event_loop().time() - send_time
                     self._debug_log(f"First batch received for {command} in {response_time:.3f}s")
                     
-                    # Check if this is a batched response
+                    # Check if this is a batched response (coerce in case server sends strings)
                     data = response_data.get("data", {})
-                    current_batch = data.get("current_batch")
-                    last_batch = data.get("last_batch")
-                    
-                    if current_batch and last_batch and last_batch > 1:
+                    current_batch = _coerce_batch_num(data.get("current_batch"))
+                    last_batch = _coerce_batch_num(data.get("last_batch"))
+
+                    if current_batch is not None and last_batch is not None and last_batch > 1:
                         # Multi-batch response expected
                         self._log_to_gui(f"📦 {command} - Receiving batch {current_batch}/{last_batch}")
                         
-                        # Wait for remaining batches with extended timeout
-                        remaining_batches = last_batch - current_batch
-                        timeout = 30 + (remaining_batches * 10)  # 10s per additional batch
+                        # Wait for remaining batches (generous timeout for large get_users)
+                        remaining_batches = max(0, last_batch - current_batch)
+                        timeout = max(120.0, 45.0 + (remaining_batches * 45.0))
                         
                         wait_start = asyncio.get_event_loop().time()
                         while not self.pending_batches[cmd_ref]["complete"]:
@@ -1113,82 +1154,39 @@ class SiteConnection:
         return False
     
     def _combine_batches(self, cmd_ref: str, initial_response: dict) -> dict:
-        """Combine multiple batches into a single response"""
+        """Merge all follow-up batches into the first response (extended + any batched WBA command)."""
         batch_info = self.pending_batches.get(cmd_ref, {})
         batches = batch_info.get("batches", [])
-        
+
         if not batches:
             return initial_response
-        
-        # Start with the initial response structure
+
         combined = initial_response.copy()
         data = combined.get("data", {})
-        
-        # Determine what type of data to combine based on keys present
-        if "users" in data:
-            all_users = data.get("users", [])
+        if not isinstance(data, dict):
+            data = {}
+
+        merged_any = False
+        for key in WBA_BATCH_MERGE_LIST_KEYS:
+            if key not in data or not isinstance(data.get(key), list):
+                continue
+            merged_any = True
+            all_items = list(data[key])
             for batch in batches:
                 batch_data = batch.get("data", {})
-                all_users.extend(batch_data.get("users", []))
-            data["users"] = all_users
+                if isinstance(batch_data, dict) and isinstance(batch_data.get(key), list):
+                    all_items.extend(batch_data[key])
+            data[key] = all_items
+
+        if merged_any:
             data["current_batch"] = batch_info.get("last_batch", 1)
-        
-        elif "calls" in data:
-            all_calls = data.get("calls", [])
-            for batch in batches:
-                batch_data = batch.get("data", {})
-                all_calls.extend(batch_data.get("calls", []))
-            data["calls"] = all_calls
-            data["current_batch"] = batch_info.get("last_batch", 1)
-        
-        elif "events" in data:
-            all_events = data.get("events", [])
-            for batch in batches:
-                batch_data = batch.get("data", {})
-                all_events.extend(batch_data.get("events", []))
-            data["events"] = all_events
-            data["current_batch"] = batch_info.get("last_batch", 1)
-        
-        elif "turrets" in data:
-            all_turrets = data.get("turrets", [])
-            for batch in batches:
-                batch_data = batch.get("data", {})
-                all_turrets.extend(batch_data.get("turrets", []))
-            data["turrets"] = all_turrets
-            data["current_batch"] = batch_info.get("last_batch", 1)
-        
-        elif "lines" in data:
-            all_lines = data.get("lines", [])
-            for batch in batches:
-                batch_data = batch.get("data", {})
-                all_lines.extend(batch_data.get("lines", []))
-            data["lines"] = all_lines
-            data["current_batch"] = batch_info.get("last_batch", 1)
-        
-        elif "sharedprofiles" in data:
-            all_profiles = data.get("sharedprofiles", [])
-            for batch in batches:
-                batch_data = batch.get("data", {})
-                all_profiles.extend(batch_data.get("sharedprofiles", []))
-            data["sharedprofiles"] = all_profiles
-            data["current_batch"] = batch_info.get("last_batch", 1)
-        
-        elif "tpos" in data:
-            all_tpos = data.get("tpos", [])
-            for batch in batches:
-                batch_data = batch.get("data", {})
-                all_tpos.extend(batch_data.get("tpos", []))
-            data["tpos"] = all_tpos
-            data["current_batch"] = batch_info.get("last_batch", 1)
-        
-        elif "zones" in data:
-            all_zones = data.get("zones", [])
-            for batch in batches:
-                batch_data = batch.get("data", {})
-                all_zones.extend(batch_data.get("zones", []))
-            data["zones"] = all_zones
-            data["current_batch"] = batch_info.get("last_batch", 1)
-        
+        elif batches:
+            self._write_log(
+                "WARNING",
+                f"Multi-batch merge for {cmd_ref}: no known list key in first batch",
+                f"data keys: {list(data.keys())}",
+            )
+
         combined["data"] = data
         return combined
     
@@ -1411,41 +1409,56 @@ class SiteConnection:
                     self.last_activity = asyncio.get_event_loop().time()
                     self._debug_log("Received message", data)
                     
-                    # Handle command responses (some doc examples use "return" for subscribe; servers typically use "response")
+                    # Command responses: batch continuation (2..N) applies to every WBA command that uses paging
+                    # (get_users, get_turrets, get_lines, get_shared_profiles, get_calls, get_events, etc.).
                     if data.get("command") in ("response", "return"):
                         cmd_ref = data.get("command_ref")
+                        if not cmd_ref:
+                            continue
+                        response_data = data.get("data", {})
+                        if not isinstance(response_data, dict):
+                            response_data = {}
+                        cur_b = _coerce_batch_num(response_data.get("current_batch"))
+                        last_b = _coerce_batch_num(response_data.get("last_batch"))
+
                         if cmd_ref in self.pending_responses:
-                            # Check if this is a batched response
-                            response_data = data.get("data", {})
-                            current_batch = response_data.get("current_batch")
-                            last_batch = response_data.get("last_batch")
-                            
-                            if current_batch and last_batch and last_batch > 1:
-                                # Multi-batch response
-                                if cmd_ref in self.pending_batches:
-                                    batch_info = self.pending_batches[cmd_ref]
-                                    batch_info["last_batch"] = last_batch
-                                    
-                                    if current_batch == 1:
-                                        # First batch - resolve the future so execute_command continues
-                                        future = self.pending_responses.pop(cmd_ref)
-                                        if not future.done():
-                                            future.set_result(data)
-                                    else:
-                                        # Subsequent batch - store it
-                                        batch_info["batches"].append(data)
-                                        self._debug_log(f"Received batch {current_batch}/{last_batch} for {cmd_ref}")
-                                        self._log_to_gui(f"📦 Batch {current_batch}/{last_batch} received")
-                                    
-                                    # Check if all batches received
-                                    if current_batch == last_batch:
-                                        batch_info["complete"] = True
-                                        self._debug_log(f"All batches complete for {cmd_ref}")
+                            # First (or only) response still tied to this Future
+                            if (
+                                cur_b is not None
+                                and last_b is not None
+                                and last_b > 1
+                                and cmd_ref in self.pending_batches
+                            ):
+                                batch_info = self.pending_batches[cmd_ref]
+                                batch_info["last_batch"] = last_b
+                                if cur_b == 1:
+                                    future = self.pending_responses.pop(cmd_ref)
+                                    if not future.done():
+                                        future.set_result(data)
+                                else:
+                                    batch_info["batches"].append(data)
+                                    self._debug_log(f"Received batch {cur_b}/{last_b} for {cmd_ref}")
+                                    self._log_to_gui(f"📦 Batch {cur_b}/{last_b} received")
+                                if cur_b == last_b:
+                                    batch_info["complete"] = True
+                                    self._debug_log(f"All batches complete for {cmd_ref}")
                             else:
-                                # Single response or first batch
                                 future = self.pending_responses.pop(cmd_ref)
                                 if not future.done():
                                     future.set_result(data)
+
+                        elif cmd_ref in self.pending_batches:
+                            # Batches 2..N: cmd_ref was removed from pending_responses after batch 1
+                            batch_info = self.pending_batches[cmd_ref]
+                            if last_b is not None:
+                                batch_info["last_batch"] = last_b
+                            if cur_b is not None and cur_b > 1:
+                                batch_info["batches"].append(data)
+                                self._debug_log(f"Received batch {cur_b}/{last_b} for {cmd_ref}")
+                                self._log_to_gui(f"📦 Batch {cur_b}/{last_b} received")
+                            if cur_b is not None and last_b is not None and cur_b == last_b:
+                                batch_info["complete"] = True
+                                self._debug_log(f"All batches complete for {cmd_ref}")
                     
                     # Handle notifications
                     elif data.get("command") == "notify":

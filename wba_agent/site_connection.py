@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import ssl
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,28 @@ from .config import SiteConfig
 from .events import Event, EventBus
 from .logging_utils import LogRotator, timestamp
 from .control_plane import ControlPlaneClient
+
+
+def _batch_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# Keep in sync with wba_logger.WBA_BATCH_MERGE_LIST_KEYS — list keys merged across WBA batch pages.
+WBA_BATCH_MERGE_LIST_KEYS = (
+    "users",
+    "turrets",
+    "lines",
+    "sharedprofiles",
+    "calls",
+    "events",
+    "tpos",
+    "zones",
+)
 
 
 class SiteConnection:
@@ -182,7 +205,7 @@ class SiteConnection:
         return None
 
     def _combine_batches(self, cmd_ref: str, initial_response: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge multi-batch WBA responses (get_users, get_calls, get_events, etc.)."""
+        """Merge follow-up batches (same keys as extended monitoring + other batched WBA commands)."""
         batch_info = self.pending_batches.get(cmd_ref, {})
         batches = batch_info.get("batches", [])
         if not batches:
@@ -191,66 +214,29 @@ class SiteConnection:
         combined = dict(initial_response)
         data = dict(combined.get("data", {}))
 
-        if "users" in data:
-            all_items = list(data.get("users", []))
+        merged_any = False
+        for key in WBA_BATCH_MERGE_LIST_KEYS:
+            if key not in data or not isinstance(data.get(key), list):
+                continue
+            merged_any = True
+            all_items = list(data[key])
             for batch in batches:
                 bd = batch.get("data", {})
-                if isinstance(bd, dict):
-                    all_items.extend(bd.get("users", []))
-            data["users"] = all_items
-        elif "calls" in data:
-            all_items = list(data.get("calls", []))
-            for batch in batches:
-                bd = batch.get("data", {})
-                if isinstance(bd, dict):
-                    all_items.extend(bd.get("calls", []))
-            data["calls"] = all_items
-        elif "events" in data:
-            all_items = list(data.get("events", []))
-            for batch in batches:
-                bd = batch.get("data", {})
-                if isinstance(bd, dict):
-                    all_items.extend(bd.get("events", []))
-            data["events"] = all_items
-        elif "turrets" in data:
-            all_items = list(data.get("turrets", []))
-            for batch in batches:
-                bd = batch.get("data", {})
-                if isinstance(bd, dict):
-                    all_items.extend(bd.get("turrets", []))
-            data["turrets"] = all_items
-        elif "lines" in data:
-            all_items = list(data.get("lines", []))
-            for batch in batches:
-                bd = batch.get("data", {})
-                if isinstance(bd, dict):
-                    all_items.extend(bd.get("lines", []))
-            data["lines"] = all_items
-        elif "sharedprofiles" in data:
-            all_items = list(data.get("sharedprofiles", []))
-            for batch in batches:
-                bd = batch.get("data", {})
-                if isinstance(bd, dict):
-                    all_items.extend(bd.get("sharedprofiles", []))
-            data["sharedprofiles"] = all_items
-        elif "tpos" in data:
-            all_items = list(data.get("tpos", []))
-            for batch in batches:
-                bd = batch.get("data", {})
-                if isinstance(bd, dict):
-                    all_items.extend(bd.get("tpos", []))
-            data["tpos"] = all_items
-        elif "zones" in data:
-            all_items = list(data.get("zones", []))
-            for batch in batches:
-                bd = batch.get("data", {})
-                if isinstance(bd, dict):
-                    all_items.extend(bd.get("zones", []))
-            data["zones"] = all_items
+                if isinstance(bd, dict) and isinstance(bd.get(key), list):
+                    all_items.extend(bd[key])
+            data[key] = all_items
 
-        lb = batch_info.get("last_batch")
-        if lb is not None:
-            data["current_batch"] = lb
+        if merged_any:
+            lb = batch_info.get("last_batch")
+            if lb is not None:
+                data["current_batch"] = lb
+        elif batches:
+            logging.getLogger(__name__).warning(
+                "Multi-batch merge for %s: no known list key in first batch keys=%s",
+                cmd_ref,
+                list(data.keys()),
+            )
+
         combined["data"] = data
         return combined
 
@@ -320,12 +306,12 @@ class SiteConnection:
                     data = response.get("data", {})
                     if not isinstance(data, dict):
                         data = {}
-                    current_batch = data.get("current_batch")
-                    last_batch = data.get("last_batch")
+                    current_batch = _batch_int(data.get("current_batch"))
+                    last_batch = _batch_int(data.get("last_batch"))
 
-                    if current_batch and last_batch and last_batch > 1:
-                        remaining = last_batch - current_batch
-                        timeout = 30 + (remaining * 10)
+                    if current_batch is not None and last_batch is not None and last_batch > 1:
+                        remaining = max(0, last_batch - current_batch)
+                        timeout = max(120.0, 45.0 + (remaining * 45.0))
                         wait_start = asyncio.get_event_loop().time()
                         while not self.pending_batches[cmd_ref]["complete"]:
                             elapsed = asyncio.get_event_loop().time() - wait_start
@@ -420,35 +406,45 @@ class SiteConnection:
                 break
 
     async def _handle_response(self, data: Dict[str, Any]) -> None:
+        """Route batch 1 via pending_responses; batches 2..N via pending_batches (all batched WBA commands)."""
         cmd_ref = data.get("command_ref")
-        if not cmd_ref or cmd_ref not in self.pending_responses:
+        if not cmd_ref:
             return
-
-        future = self.pending_responses[cmd_ref]
         payload = data.get("data", {})
         if not isinstance(payload, dict):
             payload = {}
-        current_batch = payload.get("current_batch")
-        last_batch = payload.get("last_batch")
+        cur = _batch_int(payload.get("current_batch"))
+        last = _batch_int(payload.get("last_batch"))
 
-        if current_batch and last_batch and last_batch > 1:
-            batch_info = self.pending_batches.get(cmd_ref)
-            if not batch_info:
+        if cmd_ref in self.pending_responses:
+            future = self.pending_responses[cmd_ref]
+            if cur is not None and last is not None and last > 1:
+                batch_info = self.pending_batches.get(cmd_ref)
+                if not batch_info:
+                    return
+                batch_info["last_batch"] = last
+                if cur == 1:
+                    self.pending_responses.pop(cmd_ref, None)
+                    if not future.done():
+                        future.set_result(data)
+                else:
+                    batch_info["batches"].append(data)
+                if cur == last:
+                    batch_info["complete"] = True
                 return
-            batch_info["last_batch"] = last_batch
-            if current_batch == 1:
-                self.pending_responses.pop(cmd_ref, None)
-                if not future.done():
-                    future.set_result(data)
-            else:
-                batch_info["batches"].append(data)
-            if current_batch == last_batch:
-                batch_info["complete"] = True
+            self.pending_responses.pop(cmd_ref, None)
+            if not future.done():
+                future.set_result(data)
             return
 
-        self.pending_responses.pop(cmd_ref, None)
-        if not future.done():
-            future.set_result(data)
+        if cmd_ref in self.pending_batches:
+            batch_info = self.pending_batches[cmd_ref]
+            if last is not None:
+                batch_info["last_batch"] = last
+            if cur is not None and cur > 1:
+                batch_info["batches"].append(data)
+            if cur is not None and last is not None and cur == last:
+                batch_info["complete"] = True
 
     async def _handle_server_notification(self, data: Dict[str, Any]) -> None:
         message = data.get("message", "")
