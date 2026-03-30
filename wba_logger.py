@@ -71,6 +71,23 @@ def _coerce_batch_num(value) -> Optional[int]:
         return None
 
 
+def _batch_meta_from_message(message: dict) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Read current_batch / last_batch from the inner data object first, then the
+    envelope (some servers put paging fields at the top level of the response).
+    """
+    payload = message.get("data")
+    if not isinstance(payload, dict):
+        payload = {}
+    cur = _coerce_batch_num(payload.get("current_batch")) or _coerce_batch_num(
+        message.get("current_batch")
+    )
+    last = _coerce_batch_num(payload.get("last_batch")) or _coerce_batch_num(
+        message.get("last_batch")
+    )
+    return cur, last
+
+
 # `data` payload list keys merged across multi-batch responses (TradeSense WBA paging).
 # Covers extended monitoring: get_users, get_turrets, get_lines, get_shared_profiles;
 # plus historical (calls, events) and core commands if the server batches them.
@@ -871,10 +888,8 @@ class SiteConnection:
                     response_time = asyncio.get_event_loop().time() - send_time
                     self._debug_log(f"First batch received for {command} in {response_time:.3f}s")
                     
-                    # Check if this is a batched response (coerce in case server sends strings)
-                    data = response_data.get("data", {})
-                    current_batch = _coerce_batch_num(data.get("current_batch"))
-                    last_batch = _coerce_batch_num(data.get("last_batch"))
+                    # Check if this is a batched response (payload + envelope, like etsv3)
+                    current_batch, last_batch = _batch_meta_from_message(response_data)
 
                     if current_batch is not None and last_batch is not None and last_batch > 1:
                         # Multi-batch response expected
@@ -1369,11 +1384,7 @@ class SiteConnection:
                         cmd_ref = data.get("command_ref")
                         if not cmd_ref:
                             continue
-                        response_data = data.get("data", {})
-                        if not isinstance(response_data, dict):
-                            response_data = {}
-                        cur_b = _coerce_batch_num(response_data.get("current_batch"))
-                        last_b = _coerce_batch_num(response_data.get("last_batch"))
+                        cur_b, last_b = _batch_meta_from_message(data)
 
                         if cmd_ref in self.pending_responses:
                             # First (or only) response still tied to this Future
@@ -1402,17 +1413,29 @@ class SiteConnection:
                                     future.set_result(data)
 
                         elif cmd_ref in self.pending_batches:
-                            # Batches 2..N: cmd_ref was removed from pending_responses after batch 1
+                            # Batches 2..N: cmd_ref was removed from pending_responses after batch 1.
+                            # Append every follow-up frame; do not require current_batch > 1 — some
+                            # servers omit or repeat current_batch on pages 2..N (see etsv3 aggregation).
                             batch_info = self.pending_batches[cmd_ref]
                             if last_b is not None:
                                 batch_info["last_batch"] = last_b
-                            if cur_b is not None and cur_b > 1:
-                                batch_info["batches"].append(data)
-                                self._debug_log(f"Received batch {cur_b}/{last_b} for {cmd_ref}")
-                                self._log_to_gui(f"📦 Batch {cur_b}/{last_b} received")
+                            batch_info["batches"].append(data)
+                            self._debug_log(f"Received follow-up batch for {cmd_ref} (page {cur_b}/{last_b})")
+                            self._log_to_gui(f"📦 Batch {cur_b or '?'}/{last_b or '?'} received")
+                            lb = batch_info.get("last_batch")
                             if cur_b is not None and last_b is not None and cur_b == last_b:
                                 batch_info["complete"] = True
                                 self._debug_log(f"All batches complete for {cmd_ref}")
+                            elif (
+                                lb is not None
+                                and lb > 1
+                                and len(batch_info["batches"]) >= lb - 1
+                            ):
+                                # Fallback when paging indices are missing on the last page(s)
+                                batch_info["complete"] = True
+                                self._debug_log(
+                                    f"All batches complete for {cmd_ref} (by count {len(batch_info['batches'])}/{lb - 1} follow-ups)"
+                                )
                     
                     # Handle notifications
                     elif data.get("command") == "notify":

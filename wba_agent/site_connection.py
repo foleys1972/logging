@@ -8,7 +8,7 @@ import json
 import logging
 import ssl
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from hashlib import sha256
 
 import websockets
@@ -27,6 +27,16 @@ def _batch_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _batch_meta_from_message(message: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    """Inner data first, then envelope (matches etsv3 / some WBA servers)."""
+    payload = message.get("data")
+    if not isinstance(payload, dict):
+        payload = {}
+    cur = _batch_int(payload.get("current_batch")) or _batch_int(message.get("current_batch"))
+    last = _batch_int(payload.get("last_batch")) or _batch_int(message.get("last_batch"))
+    return cur, last
 
 
 # Keep in sync with wba_logger.WBA_BATCH_MERGE_LIST_KEYS — list keys merged across WBA batch pages.
@@ -303,11 +313,7 @@ class SiteConnection:
 
                 try:
                     response = await asyncio.wait_for(future, timeout=30)
-                    data = response.get("data", {})
-                    if not isinstance(data, dict):
-                        data = {}
-                    current_batch = _batch_int(data.get("current_batch"))
-                    last_batch = _batch_int(data.get("last_batch"))
+                    current_batch, last_batch = _batch_meta_from_message(response)
 
                     if current_batch is not None and last_batch is not None and last_batch > 1:
                         remaining = max(0, last_batch - current_batch)
@@ -410,11 +416,7 @@ class SiteConnection:
         cmd_ref = data.get("command_ref")
         if not cmd_ref:
             return
-        payload = data.get("data", {})
-        if not isinstance(payload, dict):
-            payload = {}
-        cur = _batch_int(payload.get("current_batch"))
-        last = _batch_int(payload.get("last_batch"))
+        cur, last = _batch_meta_from_message(data)
 
         if cmd_ref in self.pending_responses:
             future = self.pending_responses[cmd_ref]
@@ -441,9 +443,11 @@ class SiteConnection:
             batch_info = self.pending_batches[cmd_ref]
             if last is not None:
                 batch_info["last_batch"] = last
-            if cur is not None and cur > 1:
-                batch_info["batches"].append(data)
+            batch_info["batches"].append(data)
+            lb = batch_info.get("last_batch")
             if cur is not None and last is not None and cur == last:
+                batch_info["complete"] = True
+            elif lb is not None and lb > 1 and len(batch_info["batches"]) >= lb - 1:
                 batch_info["complete"] = True
 
     async def _handle_server_notification(self, data: Dict[str, Any]) -> None:
