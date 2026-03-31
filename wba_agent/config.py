@@ -8,6 +8,24 @@ from typing import Any, Dict, List, Optional
 import json
 
 
+def _coerce_bool(value: Any, default: bool = True) -> bool:
+    """Never use bool(str): bool('false') is True in Python."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("false", "0", "no", "off", "n"):
+            return False
+        if v in ("true", "1", "yes", "on", "y"):
+            return True
+        return default
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
 # Shared command catalogue reused from the legacy logger.
 AVAILABLE_COMMANDS: Dict[str, List[str]] = {
     "core": [
@@ -65,7 +83,7 @@ class SiteConfig:
             ignore_ssl=data.get("ignore_ssl", False),
             auto_start=data.get("auto_start", False),
             debug_mode=data.get("debug_mode", False),
-            get_lines_info=bool(data.get("get_lines_info", True)),
+            get_lines_info=_coerce_bool(data.get("get_lines_info", True), True),
             interval_minutes=data.get("interval_minutes"),
             log_dir=data.get("log_dir"),
             control_plane_site_id=data.get("control_plane_site_id"),

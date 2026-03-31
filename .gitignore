@@ -19,6 +19,7 @@ etsv3.py
 # Logs & databases
 logs/
 *.log
+log.txt
 *.sqlite
 *.db
 

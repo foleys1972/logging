@@ -20,7 +20,7 @@ Features:
 - SSL certificate verification bypass (for self-signed certs)
 - Auto-start sites on application launch
 - Auto-reconnect with 3 retry attempts on connection loss
-- Per-site debug logging with toggle capability
+- Per-site debug logging with toggle capability; optional per-command raw WebSocket capture (raw_capture_commands)
 - Per-site command configuration
 - Comprehensive command selection UI
 - Baseline reset capability
@@ -61,6 +61,24 @@ DEFAULT_LOG_RETENTION_DAYS = 365
 MAX_LOG_RETENTION_DAYS = 3650
 
 
+def _coerce_bool(value: Any, default: bool = True) -> bool:
+    """Config / API booleans — never use bool(str): bool('false') is True in Python."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("false", "0", "no", "off", "n"):
+            return False
+        if v in ("true", "1", "yes", "on", "y"):
+            return True
+        return default
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
 def _coerce_batch_num(value) -> Optional[int]:
     """WBA may send current_batch/last_batch as int or string."""
     if value is None or value == "":
@@ -73,18 +91,24 @@ def _coerce_batch_num(value) -> Optional[int]:
 
 def _batch_meta_from_message(message: dict) -> Tuple[Optional[int], Optional[int]]:
     """
-    Read current_batch / last_batch from the inner data object first, then the
-    envelope (some servers put paging fields at the top level of the response).
+    Read current_batch / last_batch from inner data and from the envelope.
+    current_batch: prefer inner, then envelope.
+    last_batch: if both levels set and differ, use max — inner often defaults to 1 while
+    the envelope carries the real page count, which would otherwise skip multi-batch wait.
     """
     payload = message.get("data")
     if not isinstance(payload, dict):
         payload = {}
-    cur = _coerce_batch_num(payload.get("current_batch")) or _coerce_batch_num(
-        message.get("current_batch")
-    )
-    last = _coerce_batch_num(payload.get("last_batch")) or _coerce_batch_num(
-        message.get("last_batch")
-    )
+    cur_inner = _coerce_batch_num(payload.get("current_batch"))
+    cur_env = _coerce_batch_num(message.get("current_batch"))
+    last_inner = _coerce_batch_num(payload.get("last_batch"))
+    last_env = _coerce_batch_num(message.get("last_batch"))
+
+    cur = cur_inner if cur_inner is not None else cur_env
+    if last_inner is not None and last_env is not None:
+        last = max(last_inner, last_env)
+    else:
+        last = last_inner if last_inner is not None else last_env
     return cur, last
 
 
@@ -206,6 +230,29 @@ def split_commands_by_schedule(site_config: Dict) -> Tuple[List[str], List[Tuple
     return interval_cmds, daily
 
 
+def _normalize_raw_capture_commands(value) -> List[str]:
+    """Site config: list or comma-separated string of WBA command names (e.g. get_users, get_events)."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return []
+
+
+def _command_matches_raw_capture(base_command: str, full_command: str, patterns: List[str]) -> bool:
+    """True if this outgoing/incoming exchange should log raw WebSocket text for debugging."""
+    if not patterns:
+        return False
+    for p in patterns:
+        if p == base_command or p == full_command:
+            return True
+        if full_command.startswith(p + ":"):
+            return True
+    return False
+
+
 class LogRotator:
     """Handles log file rotation"""
     
@@ -302,8 +349,16 @@ class SiteConnection:
             "zones": None,
             "tpos": None
         }
-        # WBA get_users: include profile.lines etc. when true (API string "true"/"false")
-        self.get_lines_info = bool(site_config.get("get_lines_info", True))
+        # WBA get_users: include profile.lines when True; coerce strings (bool("false") must not be True)
+        self.get_lines_info = _coerce_bool(site_config.get("get_lines_info", True), True)
+        self.raw_capture_commands = _normalize_raw_capture_commands(
+            site_config.get("raw_capture_commands", [])
+        )
+
+    def _next_command_ref(self) -> str:
+        """Numeric-only command_ref (same strategy as etsv3.py make_command_ref). Alphanumeric refs can break multi-frame get_users batch correlation on some WBA servers."""
+        self.command_ref += 1
+        return str(int(time.time() * 1000000) + self.command_ref)
 
     def _daily_fire(self, cmd: str, time_str: str, now_local: datetime) -> bool:
         """True once per local calendar day when hour:minute matches scheduled time."""
@@ -319,6 +374,29 @@ class SiteConnection:
         self._daily_last_run[cmd] = key
         return True
     
+    def _write_raw_capture(
+        self, direction: str, cmd_ref: str, base_command: str, raw_text: str
+    ) -> None:
+        """Append exact WebSocket text to the site log for troubleshooting (per-site raw_capture_commands)."""
+        ts = self._timestamp()
+        n = len(raw_text)
+        self.log.write(
+            f"[{ts}] [RAW_CAPTURE] {direction} ref={cmd_ref} command={base_command} bytes={n}"
+        )
+        self.log.write(raw_text)
+
+    def _raw_capture_for_ref(self, cmd_ref: str) -> bool:
+        if not self.raw_capture_commands:
+            return False
+        bi = self.pending_batches.get(cmd_ref)
+        if not bi:
+            return False
+        return _command_matches_raw_capture(
+            bi.get("command_name") or "",
+            bi.get("full_command") or "",
+            self.raw_capture_commands,
+        )
+
     def _debug_log(self, message: str, data: any = None):
         """Log debug information if debug mode is enabled"""
         if self.debug_mode:
@@ -405,7 +483,8 @@ class SiteConnection:
             self.log.write(json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
             self.log.write("[get_users] One user per line below — search for login to step through records.")
             self.log.write(
-                "[get_users note] Rows are from WBA only; blocked or policy-excluded users may be omitted by the server."
+                "[get_users note] WBA returns users per server scope (e.g. zones managed by Assure). "
+                "command_ref is numeric-only (same as TradeSense Engineering Tool) so multi-frame batches correlate."
             )
             for u in users:
                 self.log.write(_user_json_line(u))
@@ -419,25 +498,72 @@ class SiteConnection:
         if not isinstance(pl, dict):
             return
         users = pl.get("users")
-        if not isinstance(users, list) or not users:
+        if not isinstance(users, list):
             return
         batch_info.setdefault("accumulated_users", []).extend(users)
 
+    async def _drain_get_users_follow_ups(self, cmd_ref: str) -> None:
+        """
+        Some servers send several get_users WebSocket frames each with last_batch=1 (etsv3 still
+        extends users for every frame). We already released the Future on frame 1 — drain until
+        no more frames append to pending_batches for this ref, then combine.
+        """
+        bi = self.pending_batches.get(cmd_ref)
+        if not bi:
+            return
+        last_n = len(bi["batches"])
+        idle_ticks = 0
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+            n = len(bi["batches"])
+            if n > last_n:
+                last_n = n
+                idle_ticks = 0
+                deadline = asyncio.get_event_loop().time() + 2.0
+            else:
+                idle_ticks += 1
+                if last_n == 0 and idle_ticks >= 3:
+                    break
+                if last_n > 0 and idle_ticks >= 6:
+                    break
+        if last_n > 0:
+            self._debug_log(
+                f"get_users: merged {last_n} extra frame(s) (same-page paging / misreported last_batch)"
+            )
+
     def _apply_accumulated_users_to_response(self, cmd_ref: str, response_data: dict) -> None:
-        """Replace data.users with concatenation of all pages' users before pending_batches is cleared."""
+        """Pick the longest of: merged list, accumulated pages, or first-page snapshot + follow-up frames (etsv3-style chain)."""
         bi = self.pending_batches.get(cmd_ref)
         if not bi:
             return
         acc = bi.get("accumulated_users") or []
-        if not acc:
-            return
         d = response_data.get("data")
         if not isinstance(d, dict):
-            response_data["data"] = {"users": list(acc)}
+            response_data["data"] = {"users": list(acc)} if acc else {}
             return
-        merged = dict(d)
-        merged["users"] = list(acc)
-        response_data["data"] = merged
+        merged = list(d.get("users") or []) if isinstance(d.get("users"), list) else []
+        snap = bi.get("first_users_snapshot")
+        last_b = _coerce_batch_num(d.get("last_batch")) or _coerce_batch_num(bi.get("last_batch"))
+        batches = bi.get("batches") or []
+        candidates: List[List] = [merged, acc]
+        if snap is not None and last_b is not None and last_b > 1:
+            chained = list(snap)
+            for batch in batches:
+                bd = batch.get("data", {})
+                if isinstance(bd, dict) and isinstance(bd.get("users"), list):
+                    chained.extend(bd["users"])
+            candidates.append(chained)
+        best = max(candidates, key=len)
+        if not best:
+            return
+        new_d = dict(d)
+        new_d["users"] = list(best)
+        response_data["data"] = new_d
+        if len(best) > len(merged) and merged:
+            self._debug_log(
+                f"get_users: final user count {len(best)} (merged-only count was {len(merged)})"
+            )
     
     def _log_to_gui(self, message: str):
         """Log message to GUI"""
@@ -530,10 +656,9 @@ class SiteConnection:
             self._update_status("Authenticating...", True, "Authenticating...")
             
             # Authenticate
-            self.command_ref += 1
             auth_msg = {
                 "command": "auth",
-                "command_ref": f"{self.site_name}_{self.command_ref}",
+                "command_ref": self._next_command_ref(),
                 "args": {"token": self.token}
             }
             
@@ -574,8 +699,7 @@ class SiteConnection:
             self._write_log("REAUTH", "Re-authentication requested by server")
             self._debug_log("Starting re-authentication")
             
-            self.command_ref += 1
-            cmd_ref = f"{self.site_name}_{self.command_ref}"
+            cmd_ref = self._next_command_ref()
             
             auth_msg = {
                 "command": "auth",
@@ -773,8 +897,7 @@ class SiteConnection:
         
         cmd_ref = None
         try:
-            self.command_ref += 1
-            cmd_ref = f"{self.site_name}_{self.command_ref}"
+            cmd_ref = self._next_command_ref()
             
             msg = {
                 "command": "subscribe",
@@ -835,8 +958,7 @@ class SiteConnection:
         
         cmd_ref = None
         try:
-            self.command_ref += 1
-            cmd_ref = f"{self.site_name}_{self.command_ref}"
+            cmd_ref = self._next_command_ref()
             
             msg = {
                 "command": "unsubscribe",
@@ -932,14 +1054,15 @@ class SiteConnection:
                 args["category"] = parts[1]
 
         if base_command == "get_users":
-            # WBA spec: get_lines_info is boolean (not string) — strings cause "wrong type" from server
-            args["get_lines_info"] = bool(self.get_lines_info)
+            # TradeSense WBA 10.x: default request uses "args": {} (spec example); get_lines_info defaults
+            # to true server-side. Only send get_lines_info when false (boolean JSON, not string).
+            if not self.get_lines_info:
+                args["get_lines_info"] = False
 
         for attempt in range(3):
             cmd_ref = None
             try:
-                self.command_ref += 1
-                cmd_ref = f"{self.site_name}_{self.command_ref}"
+                cmd_ref = self._next_command_ref()
                 
                 msg = {
                     "command": base_command,
@@ -956,11 +1079,17 @@ class SiteConnection:
                     "last_batch": None,
                     "complete": False,
                     "accumulated_users": [],
+                    "first_users_snapshot": None,
+                    "command_name": base_command,
+                    "full_command": command,
                 }
                 
                 send_time = asyncio.get_event_loop().time()
                 self._debug_log(f"Sending command: {command}", msg)
-                await self.websocket.send(json.dumps(msg))
+                out_json = json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
+                if _command_matches_raw_capture(base_command, command, self.raw_capture_commands):
+                    self._write_raw_capture("out", cmd_ref, base_command, out_json)
+                await self.websocket.send(out_json)
                 
                 # Wait for all batches to arrive
                 try:
@@ -989,10 +1118,13 @@ class SiteConnection:
                                 self._log_to_gui(f"⚠️ {command} - Timeout, received {len(self.pending_batches[cmd_ref]['batches'])}/{last_batch} batches")
                                 break
                             await asyncio.sleep(0.1)
-                        
-                        # Combine all batches
-                        if self.pending_batches[cmd_ref]["batches"]:
-                            response_data = self._combine_batches(cmd_ref, response_data)
+
+                    if base_command == "get_users":
+                        await self._drain_get_users_follow_ups(cmd_ref)
+
+                    if self.pending_batches.get(cmd_ref, {}).get("batches"):
+                        response_data = self._combine_batches(cmd_ref, response_data)
+                        if current_batch is not None and last_batch is not None and last_batch > 1:
                             total_time = asyncio.get_event_loop().time() - send_time
                             self._debug_log(f"All {last_batch} batches received for {command} in {total_time:.3f}s")
                             self._log_to_gui(f"✓ {command} - Received all {last_batch} batches")
@@ -1462,7 +1594,8 @@ class SiteConnection:
                         self._debug_log("Received binary frame (ping/pong)")
                         continue
                     
-                    data = json.loads(message)
+                    raw_text = message if isinstance(message, str) else message.decode("utf-8", errors="replace")
+                    data = json.loads(raw_text)
                     self.last_activity = asyncio.get_event_loop().time()
                     self._debug_log("Received message", data)
                     
@@ -1472,6 +1605,14 @@ class SiteConnection:
                         cmd_ref = data.get("command_ref")
                         if not cmd_ref:
                             continue
+                        if self._raw_capture_for_ref(cmd_ref):
+                            bi = self.pending_batches.get(cmd_ref) or {}
+                            self._write_raw_capture(
+                                "in",
+                                cmd_ref,
+                                bi.get("command_name") or "?",
+                                raw_text,
+                            )
                         cur_b, last_b = _batch_meta_from_message(data)
 
                         if cmd_ref in self.pending_responses:
@@ -1485,6 +1626,12 @@ class SiteConnection:
                                 batch_info = self.pending_batches[cmd_ref]
                                 batch_info["last_batch"] = last_b
                                 if cur_b == 1:
+                                    pl0 = data.get("data", {})
+                                    if isinstance(pl0, dict):
+                                        u0 = pl0.get("users")
+                                        batch_info["first_users_snapshot"] = (
+                                            list(u0) if isinstance(u0, list) else []
+                                        )
                                     self._accumulate_users_from_batch_message(batch_info, data)
                                     future = self.pending_responses.pop(cmd_ref)
                                     if not future.done():
@@ -1494,7 +1641,8 @@ class SiteConnection:
                                     batch_info["batches"].append(data)
                                     self._debug_log(f"Received batch {cur_b}/{last_b} for {cmd_ref}")
                                     self._log_to_gui(f"📦 Batch {cur_b}/{last_b} received")
-                                if cur_b == last_b:
+                                # Match etsv3: done when current_batch >= last_batch (not only ==).
+                                if cur_b is not None and last_b is not None and cur_b >= last_b:
                                     batch_info["complete"] = True
                                     self._debug_log(f"All batches complete for {cmd_ref}")
                             else:
@@ -1517,8 +1665,7 @@ class SiteConnection:
                             batch_info["batches"].append(data)
                             self._debug_log(f"Received follow-up batch for {cmd_ref} (page {cur_b}/{last_b})")
                             self._log_to_gui(f"📦 Batch {cur_b or '?'}/{last_b or '?'} received")
-                            lb = batch_info.get("last_batch")
-                            if cur_b is not None and last_b is not None and cur_b == last_b:
+                            if cur_b is not None and last_b is not None and cur_b >= last_b:
                                 batch_info["complete"] = True
                                 self._debug_log(f"All batches complete for {cmd_ref}")
                     
@@ -1700,6 +1847,11 @@ class WBALoggerApp:
             migrate_site_command_settings(site)
             if "get_lines_info" not in site:
                 site["get_lines_info"] = True
+            site["get_lines_info"] = _coerce_bool(site.get("get_lines_info", True), True)
+            if "raw_capture_commands" not in site:
+                site["raw_capture_commands"] = []
+            elif not isinstance(site.get("raw_capture_commands"), list):
+                site["raw_capture_commands"] = _normalize_raw_capture_commands(site.get("raw_capture_commands"))
         
         return config
     
@@ -2248,6 +2400,7 @@ class SiteDialog(tk.Toplevel):
             "auto_start": False,
             "debug_mode": False,
             "get_lines_info": True,
+            "raw_capture_commands": [],
             "commands": DEFAULT_COMMANDS.copy(),
             "command_settings": {},
             "log_dir": None,
@@ -2366,6 +2519,23 @@ class SiteDialog(tk.Toplevel):
                  font=('TkDefaultFont', 8, 'italic'),
                  foreground='gray').pack(anchor=tk.W, padx=(20, 0))
         
+        ttk.Label(
+            options_frame,
+            text="Raw WebSocket capture (comma-separated commands):",
+            font=('TkDefaultFont', 9, 'bold'),
+        ).pack(anchor=tk.W, pady=(12, 4))
+        self.raw_capture_var = tk.StringVar()
+        rc_row = ttk.Frame(options_frame)
+        rc_row.pack(fill=tk.X, pady=2)
+        ttk.Entry(rc_row, textvariable=self.raw_capture_var, width=55).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(
+            options_frame,
+            text="↳ For each listed command, logs exact outbound request and inbound response JSON (same ref). "
+            "Example: get_users — use to verify the server sends data the app does not merge. Restart site after change.",
+            font=('TkDefaultFont', 8, 'italic'),
+            foreground='gray',
+        ).pack(anchor=tk.W, padx=(0, 0))
+        
         # Log directory selection
         ttk.Separator(options_frame, orient='horizontal').pack(fill=tk.X, pady=10)
         
@@ -2392,8 +2562,9 @@ class SiteDialog(tk.Toplevel):
             padding="10",
         )
         get_users_frame.pack(fill=tk.X, pady=(0, 10))
+        _gli = _coerce_bool(self.site_data.get("get_lines_info", True), True)
         self.get_lines_mode = tk.StringVar(
-            value="with_lines" if self.site_data.get("get_lines_info", True) else "without_lines"
+            value="with_lines" if _gli else "without_lines"
         )
         ttk.Label(
             get_users_frame,
@@ -2482,9 +2653,13 @@ class SiteDialog(tk.Toplevel):
         self.ignore_ssl_var.set(self.site_data.get("ignore_ssl", False))
         self.auto_start_var.set(self.site_data.get("auto_start", False))
         self.debug_var.set(self.site_data.get("debug_mode", False))
-        self.get_lines_mode.set(
-            "with_lines" if self.site_data.get("get_lines_info", True) else "without_lines"
-        )
+        gli = _coerce_bool(self.site_data.get("get_lines_info", True), True)
+        self.get_lines_mode.set("with_lines" if gli else "without_lines")
+        rc = self.site_data.get("raw_capture_commands") or []
+        if isinstance(rc, list):
+            self.raw_capture_var.set(", ".join(rc))
+        else:
+            self.raw_capture_var.set(str(rc).strip())
     
     def toggle_token(self):
         """Toggle token visibility"""
@@ -2546,6 +2721,7 @@ class SiteDialog(tk.Toplevel):
             "auto_start": self.auto_start_var.get(),
             "debug_mode": self.debug_var.get(),
             "get_lines_info": self.get_lines_mode.get() == "with_lines",
+            "raw_capture_commands": _normalize_raw_capture_commands(self.raw_capture_var.get()),
             "commands": selected_commands,
             "command_settings": command_settings,
             "log_dir": log_dir

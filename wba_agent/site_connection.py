@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import ssl
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from hashlib import sha256
@@ -30,12 +31,20 @@ def _batch_int(value: Any) -> Optional[int]:
 
 
 def _batch_meta_from_message(message: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    """Inner data first, then envelope (matches etsv3 / some WBA servers)."""
+    """Inner data + envelope; last_batch uses max when both set (inner may default to 1)."""
     payload = message.get("data")
     if not isinstance(payload, dict):
         payload = {}
-    cur = _batch_int(payload.get("current_batch")) or _batch_int(message.get("current_batch"))
-    last = _batch_int(payload.get("last_batch")) or _batch_int(message.get("last_batch"))
+    cur_inner = _batch_int(payload.get("current_batch"))
+    cur_env = _batch_int(message.get("current_batch"))
+    last_inner = _batch_int(payload.get("last_batch"))
+    last_env = _batch_int(message.get("last_batch"))
+
+    cur = cur_inner if cur_inner is not None else cur_env
+    if last_inner is not None and last_env is not None:
+        last = max(last_inner, last_env)
+    else:
+        last = last_inner if last_inner is not None else last_env
     return cur, last
 
 
@@ -90,6 +99,11 @@ class SiteConnection:
             retention_days=self._log_retention_days,
         )
         self.baseline = {"zones": None, "tpos": None}
+
+    def _next_command_ref(self) -> str:
+        """Numeric-only command_ref (matches etsv3 / TradeSense Engineering Tool)."""
+        self.command_ref += 1
+        return str(int(time.time() * 1000000) + self.command_ref)
 
     async def run(self) -> None:
         """Entry point for auto-reconnect loop."""
@@ -179,8 +193,7 @@ class SiteConnection:
             self.connection_alive = True
             await self._notify("status", {"status": "authenticating"})
 
-            self.command_ref += 1
-            cmd_ref = f"{self.cfg.name}_{self.command_ref}"
+            cmd_ref = self._next_command_ref()
             auth_msg = {"command": "auth", "command_ref": cmd_ref, "args": {"token": self.cfg.token}}
 
             await self.websocket.send(json.dumps(auth_msg))
@@ -256,24 +269,69 @@ class SiteConnection:
         if not isinstance(pl, dict):
             return
         users = pl.get("users")
-        if not isinstance(users, list) or not users:
+        if not isinstance(users, list):
             return
         batch_info.setdefault("accumulated_users", []).extend(users)
+
+    async def _drain_get_users_follow_ups(self, cmd_ref: str) -> None:
+        """Wait for extra get_users frames that repeat last_batch=1 (etsv3 extends every frame)."""
+        bi = self.pending_batches.get(cmd_ref)
+        if not bi:
+            return
+        last_n = len(bi["batches"])
+        idle_ticks = 0
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+            n = len(bi["batches"])
+            if n > last_n:
+                last_n = n
+                idle_ticks = 0
+                deadline = asyncio.get_event_loop().time() + 2.0
+            else:
+                idle_ticks += 1
+                if last_n == 0 and idle_ticks >= 3:
+                    break
+                if last_n > 0 and idle_ticks >= 6:
+                    break
+        if last_n > 0:
+            logging.getLogger(__name__).debug(
+                "get_users: merged %s extra frame(s) (misreported paging)", last_n
+            )
 
     def _apply_accumulated_users_to_response(self, cmd_ref: str, response_data: Dict[str, Any]) -> None:
         bi = self.pending_batches.get(cmd_ref)
         if not bi:
             return
         acc = bi.get("accumulated_users") or []
-        if not acc:
-            return
         d = response_data.get("data")
         if not isinstance(d, dict):
-            response_data["data"] = {"users": list(acc)}
+            response_data["data"] = {"users": list(acc)} if acc else {}
             return
-        merged = dict(d)
-        merged["users"] = list(acc)
-        response_data["data"] = merged
+        merged = list(d.get("users") or []) if isinstance(d.get("users"), list) else []
+        snap = bi.get("first_users_snapshot")
+        last_b = _batch_int(d.get("last_batch")) or _batch_int(bi.get("last_batch"))
+        batches = bi.get("batches") or []
+        candidates: List[List[Any]] = [merged, acc]
+        if snap is not None and last_b is not None and last_b > 1:
+            chained = list(snap)
+            for batch in batches:
+                bd = batch.get("data", {})
+                if isinstance(bd, dict) and isinstance(bd.get("users"), list):
+                    chained.extend(bd["users"])
+            candidates.append(chained)
+        best = max(candidates, key=len)
+        if not best:
+            return
+        new_d = dict(d)
+        new_d["users"] = list(best)
+        response_data["data"] = new_d
+        if len(best) > len(merged) and merged:
+            logging.getLogger(__name__).debug(
+                "get_users: final count %s (merged-only was %s)",
+                len(best),
+                len(merged),
+            )
 
     async def _resubscribe_notifications_after_reauth(self) -> None:
         """WBA spec: after re-authentication, subscribe again to notification categories."""
@@ -324,14 +382,14 @@ class SiteConnection:
                 args["category"] = parts[1]
 
         if base_command == "get_users":
-            # WBA spec: boolean; strings "true"/"false" are rejected as wrong type
-            args["get_lines_info"] = bool(self.cfg.get_lines_info)
+            # Match Main API / etsv3: {} when default (true); only set key when false
+            if not self.cfg.get_lines_info:
+                args["get_lines_info"] = False
 
         for attempt in range(3):
             cmd_ref = None
             try:
-                self.command_ref += 1
-                cmd_ref = f"{self.cfg.name}_{self.command_ref}"
+                cmd_ref = self._next_command_ref()
                 msg = {"command": base_command, "command_ref": cmd_ref, "args": args}
 
                 future: "asyncio.Future[Dict[str, Any]]" = asyncio.Future()
@@ -341,6 +399,9 @@ class SiteConnection:
                     "last_batch": None,
                     "complete": False,
                     "accumulated_users": [],
+                    "first_users_snapshot": None,
+                    "command_name": base_command,
+                    "full_command": command,
                 }
 
                 await self.websocket.send(json.dumps(msg))
@@ -362,8 +423,12 @@ class SiteConnection:
                                 )
                                 break
                             await asyncio.sleep(0.1)
-                        if self.pending_batches[cmd_ref]["batches"]:
-                            response = self._combine_batches(cmd_ref, response)
+
+                    if base_command == "get_users":
+                        await self._drain_get_users_follow_ups(cmd_ref)
+
+                    if self.pending_batches.get(cmd_ref, {}).get("batches"):
+                        response = self._combine_batches(cmd_ref, response)
                     self._apply_accumulated_users_to_response(cmd_ref, response)
                 except asyncio.TimeoutError:
                     self.pending_responses.pop(cmd_ref, None)
@@ -461,6 +526,10 @@ class SiteConnection:
                     return
                 batch_info["last_batch"] = last
                 if cur == 1:
+                    pl0 = data.get("data", {})
+                    if isinstance(pl0, dict):
+                        u0 = pl0.get("users")
+                        batch_info["first_users_snapshot"] = list(u0) if isinstance(u0, list) else []
                     self._accumulate_users_from_batch_message(batch_info, data)
                     self.pending_responses.pop(cmd_ref, None)
                     if not future.done():
@@ -468,7 +537,7 @@ class SiteConnection:
                 else:
                     self._accumulate_users_from_batch_message(batch_info, data)
                     batch_info["batches"].append(data)
-                if cur == last:
+                if cur is not None and last is not None and cur >= last:
                     batch_info["complete"] = True
                 return
             if cmd_ref in self.pending_batches:
@@ -484,7 +553,7 @@ class SiteConnection:
                 batch_info["last_batch"] = last
             self._accumulate_users_from_batch_message(batch_info, data)
             batch_info["batches"].append(data)
-            if cur is not None and last is not None and cur == last:
+            if cur is not None and last is not None and cur >= last:
                 batch_info["complete"] = True
 
     async def _handle_server_notification(self, data: Dict[str, Any]) -> None:
@@ -506,8 +575,7 @@ class SiteConnection:
         if not self.websocket:
             return False
         try:
-            self.command_ref += 1
-            cmd_ref = f"{self.cfg.name}_{self.command_ref}"
+            cmd_ref = self._next_command_ref()
             msg = {"command": "auth", "command_ref": cmd_ref, "args": {"token": self.cfg.token}}
 
             future: "asyncio.Future[Dict[str, Any]]" = asyncio.Future()
@@ -538,8 +606,7 @@ class SiteConnection:
         if not self.websocket:
             return False
         try:
-            self.command_ref += 1
-            cmd_ref = f"{self.cfg.name}_{self.command_ref}"
+            cmd_ref = self._next_command_ref()
             msg = {"command": "subscribe", "command_ref": cmd_ref, "args": {"category": category}}
 
             future: "asyncio.Future[Dict[str, Any]]" = asyncio.Future()

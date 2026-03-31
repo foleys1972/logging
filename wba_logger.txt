@@ -9,7 +9,7 @@ Features:
 - Periodic command execution
 - Automatic multi-batch response handling for get_users, get_calls, get_events
 - 10MB WebSocket frame size limit (handles large batches)
-- Command responses logged as JSON (size cap on disk only; WBA batches are merged in full first)
+- Command responses logged as full JSON (WBA batches are merged in full before logging)
 - Debug mode logs ALL messages (requests, timing, notifications, etc.)
 - Server-managed keepalive (server pings every 5s per API default)
 - Passive connection monitoring (checks state, doesn't interfere with server pings)
@@ -33,7 +33,7 @@ Alert Notifications:
 - Notifications appear in both GUI and log files
 
 Logging Behavior:
-- Normal mode: Command responses with full JSON data (truncated in log file if over cap; see MAX_COMMAND_LOG_JSON_BYTES)
+- Normal mode: Command responses as JSON (get_users: one line per user; search for login)
 - Debug mode: Everything above + request details, timing, all notifications, detailed errors
 
 Important: The server manages connection keepalive via ping frames (default 5 seconds).
@@ -50,18 +50,33 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 import threading
 import time
-
 # Constants
 CONFIG_FILE = "wba_config.json"
 LOG_BASE_DIR = "logs"
 MAX_LOG_SIZE = 50 * 1024 * 1024  # 50MB
-# Max JSON size written per COMMAND log entry (API data is fully received/merged before this)
-MAX_COMMAND_LOG_JSON_BYTES = 1024 * 1024  # 1 MiB
 DEFAULT_LOG_RETENTION_DAYS = 365
 MAX_LOG_RETENTION_DAYS = 3650
+
+
+def _coerce_bool(value: Any, default: bool = True) -> bool:
+    """Config / API booleans — never use bool(str): bool('false') is True in Python."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("false", "0", "no", "off", "n"):
+            return False
+        if v in ("true", "1", "yes", "on", "y"):
+            return True
+        return default
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
 
 
 def _coerce_batch_num(value) -> Optional[int]:
@@ -72,6 +87,23 @@ def _coerce_batch_num(value) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _batch_meta_from_message(message: dict) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Read current_batch / last_batch from the inner data object first, then the
+    envelope (some servers put paging fields at the top level of the response).
+    """
+    payload = message.get("data")
+    if not isinstance(payload, dict):
+        payload = {}
+    cur = _coerce_batch_num(payload.get("current_batch")) or _coerce_batch_num(
+        message.get("current_batch")
+    )
+    last = _coerce_batch_num(payload.get("last_batch")) or _coerce_batch_num(
+        message.get("last_batch")
+    )
+    return cur, last
 
 
 # `data` payload list keys merged across multi-batch responses (TradeSense WBA paging).
@@ -87,6 +119,13 @@ WBA_BATCH_MERGE_LIST_KEYS = (
     "tpos",
     "zones",
 )
+
+
+def _user_json_line(user: Any) -> str:
+    """One compact JSON line per user (natural field order from API; grep for login)."""
+    if not isinstance(user, dict):
+        return json.dumps({"_value": user}, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(user, ensure_ascii=False, separators=(",", ":"))
 
 
 # Available WBA commands
@@ -281,6 +320,8 @@ class SiteConnection:
             "zones": None,
             "tpos": None
         }
+        # WBA get_users: include profile.lines when True; coerce strings (bool("false") must not be True)
+        self.get_lines_info = _coerce_bool(site_config.get("get_lines_info", True), True)
 
     def _daily_fire(self, cmd: str, time_str: str, now_local: datetime) -> bool:
         """True once per local calendar day when hour:minute matches scheduled time."""
@@ -345,52 +386,84 @@ class SiteConnection:
         
         if should_write_data:
             try:
-                json_str = json.dumps(full_data)
-                if len(json_str) > MAX_COMMAND_LOG_JSON_BYTES:
-                    data = full_data.get("data", {})
-                    if not isinstance(data, dict):
-                        data = {}
-                    truncated = {
-                        "_note": (
-                            "Log file JSON size cap — the client already received and merged all WBA response "
-                            "batches (current_batch / last_batch). Counts below are from the full merged result."
-                        ),
-                        "_log_cap_bytes": MAX_COMMAND_LOG_JSON_BYTES,
-                        "_serialized_size_bytes": len(json_str),
-                        "command": full_data.get("command"),
-                        "success": full_data.get("success"),
-                        "data_keys": list(data.keys()) if data else None,
-                    }
-                    for k in ("current_batch", "last_batch"):
-                        if k in data:
-                            truncated[k] = data.get(k)
-                    # Add count information if available (merged lists)
-                    if "users" in data:
-                        truncated["user_count"] = len(data.get("users", []))
-                    elif "calls" in data:
-                        truncated["call_count"] = len(data.get("calls", []))
-                    elif "events" in data:
-                        truncated["event_count"] = len(data.get("events", []))
-                    elif "turrets" in data:
-                        truncated["turret_count"] = len(data.get("turrets", []))
-                    elif "zones" in data:
-                        truncated["zone_count"] = len(data.get("zones", []))
-                    elif "tpos" in data:
-                        truncated["tpo_count"] = len(data.get("tpos", []))
-                    elif "lines" in data:
-                        truncated["line_count"] = len(data.get("lines", []))
-                    elif "sharedprofiles" in data:
-                        truncated["profile_count"] = len(data.get("sharedprofiles", []))
-                    
-                    self.log.write(json.dumps(truncated))
-                    self.log.write(
-                        f"[Serialized COMMAND response was {len(json_str)} bytes — "
-                        f"log stores summary only; cap {MAX_COMMAND_LOG_JSON_BYTES} bytes]"
-                    )
-                else:
-                    self.log.write(json_str)
+                self.log.write(json.dumps(full_data, ensure_ascii=False))
             except Exception as e:
                 self.log.write(f"[Error serializing response: {str(e)}]")
+
+    def _write_log_get_users(
+        self, command: str, data_summary: str, response_data: Dict
+    ) -> None:
+        """Summary line, compact meta, marker, then one JSON line per user (search file for login)."""
+        timestamp = self._timestamp()
+        self.log.write(f"[{timestamp}] [COMMAND] [{command}] | {data_summary}")
+        data = response_data.get("data", {})
+        users: List = []
+        if isinstance(data, dict):
+            u = data.get("users")
+            if isinstance(u, list):
+                users = u
+            meta = {
+                "command": response_data.get("command"),
+                "success": response_data.get("success"),
+                "command_ref": response_data.get("command_ref"),
+                "data": {
+                    k: v
+                    for k, v in data.items()
+                    if k != "users"
+                },
+            }
+            meta["data"]["user_count"] = len(users)
+        else:
+            meta = {
+                "command": response_data.get("command"),
+                "success": response_data.get("success"),
+                "data": data,
+            }
+        try:
+            self.log.write(json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
+            self.log.write("[get_users] One user per line below — search for login to step through records.")
+            self.log.write(
+                "[get_users note] Rows are from WBA only; blocked or policy-excluded users may be omitted by the server."
+            )
+            for u in users:
+                self.log.write(_user_json_line(u))
+        except Exception as e:
+            self.log.write(f"[Error serializing get_users lines: {str(e)}]")
+
+    @staticmethod
+    def _accumulate_users_from_batch_message(batch_info: dict, message: dict) -> None:
+        """Etsv3-style: extend with users[] from every batch page (same command_ref)."""
+        pl = message.get("data", {})
+        if not isinstance(pl, dict):
+            return
+        users = pl.get("users")
+        if not isinstance(users, list):
+            return
+        batch_info.setdefault("accumulated_users", []).extend(users)
+
+    def _apply_accumulated_users_to_response(self, cmd_ref: str, response_data: dict) -> None:
+        """Prefer the longer of accumulated pages vs merge — never replace 63 rows with 61."""
+        bi = self.pending_batches.get(cmd_ref)
+        if not bi:
+            return
+        acc = bi.get("accumulated_users") or []
+        d = response_data.get("data")
+        if not isinstance(d, dict):
+            response_data["data"] = {"users": list(acc)} if acc else {}
+            return
+        merged = list(d.get("users") or []) if isinstance(d.get("users"), list) else []
+        if len(acc) > len(merged):
+            new_d = dict(d)
+            new_d["users"] = list(acc)
+            response_data["data"] = new_d
+        elif len(merged) > len(acc) and acc:
+            self._debug_log(
+                f"get_users: using merged list ({len(merged)}) over accumulated ({len(acc)}) — check batch routing"
+            )
+        elif acc and not merged:
+            new_d = dict(d)
+            new_d["users"] = list(acc)
+            response_data["data"] = new_d
     
     def _log_to_gui(self, message: str):
         """Log message to GUI"""
@@ -883,7 +956,13 @@ class SiteConnection:
             base_command = parts[0]
             if base_command == "get_events":
                 args["category"] = parts[1]
-        
+
+        if base_command == "get_users":
+            # Match etsv3 / Main API: empty args when using defaults (get_lines_info defaults to true per WBA spec).
+            # Sending explicit true caused a different result count on some servers vs etsv3.
+            if not self.get_lines_info:
+                args["get_lines_info"] = False
+
         for attempt in range(3):
             cmd_ref = None
             try:
@@ -903,7 +982,8 @@ class SiteConnection:
                 self.pending_batches[cmd_ref] = {
                     "batches": [],
                     "last_batch": None,
-                    "complete": False
+                    "complete": False,
+                    "accumulated_users": [],
                 }
                 
                 send_time = asyncio.get_event_loop().time()
@@ -917,10 +997,8 @@ class SiteConnection:
                     response_time = asyncio.get_event_loop().time() - send_time
                     self._debug_log(f"First batch received for {command} in {response_time:.3f}s")
                     
-                    # Check if this is a batched response (coerce in case server sends strings)
-                    data = response_data.get("data", {})
-                    current_batch = _coerce_batch_num(data.get("current_batch"))
-                    last_batch = _coerce_batch_num(data.get("last_batch"))
+                    # Check if this is a batched response (payload + envelope, like etsv3)
+                    current_batch, last_batch = _batch_meta_from_message(response_data)
 
                     if current_batch is not None and last_batch is not None and last_batch > 1:
                         # Multi-batch response expected
@@ -946,7 +1024,10 @@ class SiteConnection:
                             total_time = asyncio.get_event_loop().time() - send_time
                             self._debug_log(f"All {last_batch} batches received for {command} in {total_time:.3f}s")
                             self._log_to_gui(f"✓ {command} - Received all {last_batch} batches")
-                    
+
+                    # Concatenate users from every page (receive order) before finally clears batch state
+                    self._apply_accumulated_users_to_response(cmd_ref, response_data)
+
                 except asyncio.TimeoutError:
                     self.pending_responses.pop(cmd_ref, None)
                     self.pending_batches.pop(cmd_ref, None)
@@ -1059,8 +1140,12 @@ class SiteConnection:
                         users = data.get("users", [])
                         user_count = len(users)
                         active_count = sum(1 for u in users if u.get("status") == "ACTIVE")
-                        self._write_log("COMMAND", f"[{command}]", 
-                                      f"Total: {user_count}, Active: {active_count}", response_data)
+                        # Do not use _write_log with full_data here — it dumps the whole users[] as one line.
+                        self._write_log_get_users(
+                            command,
+                            f"Total: {user_count}, Active: {active_count}",
+                            response_data,
+                        )
                         self._log_to_gui(f"✓ {command} - Users: {user_count} (Active: {active_count})")
                     
                     elif base_command == "get_calls":
@@ -1168,15 +1253,15 @@ class SiteConnection:
 
         merged_any = False
         for key in WBA_BATCH_MERGE_LIST_KEYS:
-            if key not in data or not isinstance(data.get(key), list):
-                continue
-            merged_any = True
-            all_items = list(data[key])
+            items_first = list(data[key]) if isinstance(data.get(key), list) else []
+            extra: List = []
             for batch in batches:
                 batch_data = batch.get("data", {})
                 if isinstance(batch_data, dict) and isinstance(batch_data.get(key), list):
-                    all_items.extend(batch_data[key])
-            data[key] = all_items
+                    extra.extend(batch_data[key])
+            if items_first or extra:
+                data[key] = items_first + extra
+                merged_any = True
 
         if merged_any:
             data["current_batch"] = batch_info.get("last_batch", 1)
@@ -1415,11 +1500,7 @@ class SiteConnection:
                         cmd_ref = data.get("command_ref")
                         if not cmd_ref:
                             continue
-                        response_data = data.get("data", {})
-                        if not isinstance(response_data, dict):
-                            response_data = {}
-                        cur_b = _coerce_batch_num(response_data.get("current_batch"))
-                        last_b = _coerce_batch_num(response_data.get("last_batch"))
+                        cur_b, last_b = _batch_meta_from_message(data)
 
                         if cmd_ref in self.pending_responses:
                             # First (or only) response still tied to this Future
@@ -1432,10 +1513,12 @@ class SiteConnection:
                                 batch_info = self.pending_batches[cmd_ref]
                                 batch_info["last_batch"] = last_b
                                 if cur_b == 1:
+                                    self._accumulate_users_from_batch_message(batch_info, data)
                                     future = self.pending_responses.pop(cmd_ref)
                                     if not future.done():
                                         future.set_result(data)
                                 else:
+                                    self._accumulate_users_from_batch_message(batch_info, data)
                                     batch_info["batches"].append(data)
                                     self._debug_log(f"Received batch {cur_b}/{last_b} for {cmd_ref}")
                                     self._log_to_gui(f"📦 Batch {cur_b}/{last_b} received")
@@ -1443,19 +1526,26 @@ class SiteConnection:
                                     batch_info["complete"] = True
                                     self._debug_log(f"All batches complete for {cmd_ref}")
                             else:
+                                if cmd_ref in self.pending_batches:
+                                    self._accumulate_users_from_batch_message(
+                                        self.pending_batches[cmd_ref], data
+                                    )
                                 future = self.pending_responses.pop(cmd_ref)
                                 if not future.done():
                                     future.set_result(data)
 
                         elif cmd_ref in self.pending_batches:
-                            # Batches 2..N: cmd_ref was removed from pending_responses after batch 1
+                            # Batches 2..N: cmd_ref was removed from pending_responses after batch 1.
+                            # Append every follow-up frame; do not require current_batch > 1 — some
+                            # servers omit or repeat current_batch on pages 2..N (see etsv3 aggregation).
                             batch_info = self.pending_batches[cmd_ref]
                             if last_b is not None:
                                 batch_info["last_batch"] = last_b
-                            if cur_b is not None and cur_b > 1:
-                                batch_info["batches"].append(data)
-                                self._debug_log(f"Received batch {cur_b}/{last_b} for {cmd_ref}")
-                                self._log_to_gui(f"📦 Batch {cur_b}/{last_b} received")
+                            self._accumulate_users_from_batch_message(batch_info, data)
+                            batch_info["batches"].append(data)
+                            self._debug_log(f"Received follow-up batch for {cmd_ref} (page {cur_b}/{last_b})")
+                            self._log_to_gui(f"📦 Batch {cur_b or '?'}/{last_b or '?'} received")
+                            lb = batch_info.get("last_batch")
                             if cur_b is not None and last_b is not None and cur_b == last_b:
                                 batch_info["complete"] = True
                                 self._debug_log(f"All batches complete for {cmd_ref}")
@@ -1636,6 +1726,9 @@ class WBALoggerApp:
             if "commands" not in site or not site["commands"]:
                 site["commands"] = DEFAULT_COMMANDS.copy()
             migrate_site_command_settings(site)
+            if "get_lines_info" not in site:
+                site["get_lines_info"] = True
+            site["get_lines_info"] = _coerce_bool(site.get("get_lines_info", True), True)
         
         return config
     
@@ -2183,6 +2276,7 @@ class SiteDialog(tk.Toplevel):
             "ignore_ssl": False,
             "auto_start": False,
             "debug_mode": False,
+            "get_lines_info": True,
             "commands": DEFAULT_COMMANDS.copy(),
             "command_settings": {},
             "log_dir": None,
@@ -2320,6 +2414,40 @@ class SiteDialog(tk.Toplevel):
         ttk.Label(options_frame, text="↳ Leave empty to use default location (./logs)", 
                  font=('TkDefaultFont', 8, 'italic'),
                  foreground='gray').pack(anchor=tk.W, padx=(20, 0))
+
+        get_users_frame = ttk.LabelFrame(
+            scrollable_frame,
+            text="get_users: with or without line information",
+            padding="10",
+        )
+        get_users_frame.pack(fill=tk.X, pady=(0, 10))
+        _gli = _coerce_bool(self.site_data.get("get_lines_info", True), True)
+        self.get_lines_mode = tk.StringVar(
+            value="with_lines" if _gli else "without_lines"
+        )
+        ttk.Label(
+            get_users_frame,
+            text="Sets WBA argument get_lines_info on every get_users request:",
+            font=('TkDefaultFont', 9),
+        ).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Radiobutton(
+            get_users_frame,
+            text="With line information — profile.lines and line details (get_lines_info = true)",
+            variable=self.get_lines_mode,
+            value="with_lines",
+        ).pack(anchor=tk.W, pady=3)
+        ttk.Radiobutton(
+            get_users_frame,
+            text="Without line information — lighter user records, no profile.lines (get_lines_info = false)",
+            variable=self.get_lines_mode,
+            value="without_lines",
+        ).pack(anchor=tk.W, pady=3)
+        ttk.Label(
+            get_users_frame,
+            text="Restart the site after changing this so the next connection uses the new setting.",
+            font=('TkDefaultFont', 8, 'italic'),
+            foreground='gray',
+        ).pack(anchor=tk.W, pady=(10, 0))
         
         # Command selection
         cmd_frame = ttk.LabelFrame(scrollable_frame, text="Monitoring Commands", padding="10")
@@ -2384,6 +2512,8 @@ class SiteDialog(tk.Toplevel):
         self.ignore_ssl_var.set(self.site_data.get("ignore_ssl", False))
         self.auto_start_var.set(self.site_data.get("auto_start", False))
         self.debug_var.set(self.site_data.get("debug_mode", False))
+        gli = _coerce_bool(self.site_data.get("get_lines_info", True), True)
+        self.get_lines_mode.set("with_lines" if gli else "without_lines")
     
     def toggle_token(self):
         """Toggle token visibility"""
@@ -2444,6 +2574,7 @@ class SiteDialog(tk.Toplevel):
             "ignore_ssl": self.ignore_ssl_var.get(),
             "auto_start": self.auto_start_var.get(),
             "debug_mode": self.debug_var.get(),
+            "get_lines_info": self.get_lines_mode.get() == "with_lines",
             "commands": selected_commands,
             "command_settings": command_settings,
             "log_dir": log_dir
