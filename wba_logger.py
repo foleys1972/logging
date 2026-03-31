@@ -33,7 +33,7 @@ Alert Notifications:
 - Notifications appear in both GUI and log files
 
 Logging Behavior:
-- Normal mode: Command responses as JSON (get_users: summary line + envelope + one JSON line per user)
+- Normal mode: Command responses as JSON (get_users: one line per user; search for login)
 - Debug mode: Everything above + request details, timing, all notifications, detailed errors
 
 Important: The server manages connection keepalive via ping frames (default 5 seconds).
@@ -103,15 +103,11 @@ WBA_BATCH_MERGE_LIST_KEYS = (
 )
 
 
-def _user_json_line_login_first(user: Any) -> str:
-    """One compact JSON line per user; always starts with {\"login\":...} (null if missing)."""
+def _user_json_line(user: Any) -> str:
+    """One compact JSON line per user (natural field order from API; grep for login)."""
     if not isinstance(user, dict):
         return json.dumps({"_value": user}, ensure_ascii=False, separators=(",", ":"))
-    ordered: Dict[str, Any] = {"login": user.get("login")}
-    for k, v in user.items():
-        if k != "login":
-            ordered[k] = v
-    return json.dumps(ordered, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(user, ensure_ascii=False, separators=(",", ":"))
 
 
 # Available WBA commands
@@ -379,7 +375,7 @@ class SiteConnection:
     def _write_log_get_users(
         self, command: str, data_summary: str, response_data: Dict
     ) -> None:
-        """Summary line, compact meta, marker, then one line per user starting with {\"login\":...}."""
+        """Summary line, compact meta, marker, then one JSON line per user (search file for login)."""
         timestamp = self._timestamp()
         self.log.write(f"[{timestamp}] [COMMAND] [{command}] | {data_summary}")
         data = response_data.get("data", {})
@@ -407,14 +403,12 @@ class SiteConnection:
             }
         try:
             self.log.write(json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
-            self.log.write(
-                "[get_users users JSONL — each line is one user object; each line begins with {\"login\":...}]"
-            )
+            self.log.write("[get_users] One user per line below — search for login to step through records.")
             self.log.write(
                 "[get_users note] Rows are from WBA only; blocked or policy-excluded users may be omitted by the server."
             )
             for u in users:
-                self.log.write(_user_json_line_login_first(u))
+                self.log.write(_user_json_line(u))
         except Exception as e:
             self.log.write(f"[Error serializing get_users lines: {str(e)}]")
 
@@ -1118,8 +1112,12 @@ class SiteConnection:
                         users = data.get("users", [])
                         user_count = len(users)
                         active_count = sum(1 for u in users if u.get("status") == "ACTIVE")
-                        self._write_log("COMMAND", f"[{command}]", 
-                                      f"Total: {user_count}, Active: {active_count}", response_data)
+                        # Do not use _write_log with full_data here — it dumps the whole users[] as one line.
+                        self._write_log_get_users(
+                            command,
+                            f"Total: {user_count}, Active: {active_count}",
+                            response_data,
+                        )
                         self._log_to_gui(f"✓ {command} - Users: {user_count} (Active: {active_count})")
                     
                     elif base_command == "get_calls":
