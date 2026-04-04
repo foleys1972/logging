@@ -1,0 +1,66 @@
+{{Logging}} — Custom License
+
+Copyright (c) {{2026}} {{foleys1972}}. All rights reserved.
+
+1. Grant of use (non-commercial)
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to use,
+   copy, modify, merge, publish, and distribute copies of the Software for
+   personal, educational, research, or internal non-commercial purposes, subject
+   to the restrictions in section 2.
+
+2. Commercial resale and exploitation — prohibited
+
+   You may not, without prior written permission from the copyright holder:
+
+   (a) Sell, rent, lease, or sublicense the Software or any derivative work based
+       on the Software, whether in original or modified form;
+
+   (b) Offer the Software or a derivative work for a fee, or as part of a
+       commercial product or service whose primary value is the Software or a
+       minor modification of it (including "reskinning," rebranding, or bundling
+       with trivial changes);
+
+   (c) Use the Software or derivative works primarily to generate revenue by
+       distributing or hosting them as a commercial offering in competition with
+       the copyright holder's distribution of {{Logging}}.
+
+   "Derivative work" includes any modification, port, fork, or combined work that
+   is substantially based on this Software.
+
+3. Who may change these terms
+
+   Only the copyright holder named above may:
+
+   • Change, replace, or supplement this license;
+
+   • Grant written exceptions to the restrictions in section 2;
+
+   • Authorize commercial use, resale, or sublicensing.
+
+   No one else may purport to release this Software under different commercial
+   terms or to waive the resale restrictions on behalf of the copyright holder.
+
+4. Attribution
+
+   Redistributions of source or binary forms must retain this license text and
+   the copyright notice above.
+
+5. Disclaimer
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING
+   FROM THE USE OF THE SOFTWARE.
+
+6. Severability
+
+   If any provision of this license is held unenforceable, the remaining provisions
+   remain in effect.
+
+---
+
+This is not legal advice. For commercial licensing or exceptions, contact the
+copyright holder.
